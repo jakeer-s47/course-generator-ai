@@ -1,0 +1,104 @@
+# Course Generator AI — local stack.
+#
+# Brings up:
+#   - db      : PostgreSQL 16
+#   - whisper : FastAPI service wrapping faster-whisper. Loads the model
+#               ONCE on startup; web container POSTs audio chunks here.
+#   - web     : Next.js app
+#
+# Volumes:
+#   - pgdata        : Postgres data files
+#   - whisper-cache : faster-whisper model downloads (~150 MB for
+#                     base.en, larger for bigger models). Without this,
+#                     the model re-downloads on every container restart.
+#   - ./web/uploads : per-job audio/transcript/chunk artifacts, host bind
+#                     so files persist across rebuilds and stay browsable
+#                     from the host.
+#
+# Usage:
+#   cp .env.docker.example .env       # edit OPENAI_API_KEY
+#   docker compose up --build
+#   open http://localhost:3000
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: chapter_db
+    ports:
+      # Exposed so you can connect with psql / a GUI client from the host.
+      # Comment out to keep the DB strictly internal to the compose network.
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d chapter_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  whisper:
+    build:
+      context: ./python
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      WHISPER_MODEL: ${WHISPER_PYTHON_MODEL:-base.en}
+      FW_DEVICE: cpu
+      FW_COMPUTE_TYPE: int8
+      FW_CPU_THREADS: ${FW_CPU_THREADS:-4}
+    volumes:
+      # Persist model downloads across container rebuilds. faster-whisper
+      # caches under HF_HOME (set in python/Dockerfile to this path).
+      - whisper-cache:/root/.cache/huggingface
+    healthcheck:
+      # /health responds 200 even before the model finishes loading; we
+      # check the body for `"ok": true` to wait until the model is live.
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request,json; r=urllib.request.urlopen('http://localhost:8000/health',timeout=2); d=json.load(r); exit(0 if d.get('ok') else 1)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    # No host port published by default — whisper is only reachable from
+    # the web container over the compose network. Uncomment to expose:
+    # ports:
+    #   - "8000:8000"
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      whisper:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/chapter_db
+      STORAGE_DIR: /app/web/uploads
+      NEXT_PUBLIC_APP_URL: http://localhost:3000
+      # Transcription provider — `python` routes through the whisper
+      # service over HTTP. Switch to `openai` if you'd rather use the
+      # Whisper API and skip the local service.
+      TRANSCRIBE_PROVIDER: ${TRANSCRIBE_PROVIDER:-python}
+      WHISPER_API_URL: http://whisper:8000
+      WHISPER_PYTHON_MODEL: ${WHISPER_PYTHON_MODEL:-base.en}
+      # Required from Step 4 onward (cleanup + segmentation use GPT-4o).
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      # Concurrency knobs.
+      WHISPER_CONCURRENCY: ${WHISPER_CONCURRENCY:-3}
+      WHISPER_PYTHON_PARALLEL: ${WHISPER_PYTHON_PARALLEL:-auto}
+    volumes:
+      # Bind-mount uploads to the host so audio/transcript files stay
+      # browsable + persist across `docker compose down --volumes`.
+      - ./web/uploads:/app/web/uploads
+
+volumes:
+  pgdata:
+  whisper-cache:

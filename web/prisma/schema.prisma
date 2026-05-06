@@ -1,0 +1,244 @@
+// Chapter AI — Prisma schema
+// Phase 1 only uses upload-related fields on Job. Pipeline fields are pre-populated
+// with sensible "already finished Phase 1" defaults so later phases can extend
+// without a breaking migration.
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../node_modules/.prisma/client"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Job {
+  id        String   @id @default(uuid()) @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz()
+
+  sessionCookie String? @map("session_cookie")
+
+  // Source file (written at upload time) — immutable after creation
+  sourceName        String  @map("source_name")
+  sourceKey         String  @map("source_key") // relative path under STORAGE_DIR
+  sourceSize        BigInt  @map("source_size")
+  sourceType        String  @map("source_type")
+  sourceDurationSec Int?    @map("source_duration_sec") // filled by ffprobe in Phase 2
+
+  // How this job was created. Existing rows default to "file" (backwards
+  // compatible — file uploads have always been the default kind).
+  //   "file"            — uploaded video / audio file
+  //   "url"             — single-video URL pasted by the user
+  //   "playlist"        — placeholder Job for a YouTube/Vimeo playlist
+  //                       (no audio/transcript; aggregates child jobs)
+  //   "playlist_video"  — child job spawned from a playlist
+  kind String @default("file")
+
+  // Self-reference: child jobs (kind="playlist_video") point at their parent
+  // (kind="playlist"). The parent owns no pipeline rows; children run the
+  // existing pipeline unchanged.
+  parentJobId String? @map("parent_job_id") @db.Uuid
+  parent      Job?    @relation("JobChildren", fields: [parentJobId], references: [id], onDelete: Cascade)
+  children    Job[]   @relation("JobChildren")
+
+  // Relations — pipeline state is one row in JobStatus (1:1).
+  status          JobStatus?
+  audio           Audio?
+  transcript      Transcript?
+  // Up to 3 cleaned versions per job (one per level: light/standard/aggressive).
+  cleanedVersions CleanedTranscript[]
+  // Many segment runs per job (one per (cleanLevel, targetMin) combination).
+  segmentRuns     SegmentRun[]
+
+  @@index([sessionCookie])
+  @@index([createdAt])
+  @@index([parentJobId])
+  @@map("jobs")
+}
+
+// One row per video. Tracks which step the video is currently on and how
+// far along that step is. Step values are short canonical names; see
+// src/lib/steps.ts for the full list.
+model JobStatus {
+  id        String   @id @default(uuid()) @db.Uuid
+  jobId     String   @unique @map("job_id") @db.Uuid  // == "video id"
+  job       Job      @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  // "audio" | "transcript" | "clean" | "split" | "render" | "done" | "failed"
+  status    String @default("audio")
+
+  // 0..100 within the current step (100 means ready to move to the next one).
+  progress  Int    @default(0)
+
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz()
+
+  @@map("job_status")
+}
+
+// One-to-one per job — the audio track extracted from the source video.
+// Stage 2 of the pipeline creates this row.
+model Audio {
+  id        String   @id @default(uuid()) @db.Uuid
+  jobId     String   @unique @map("job_id") @db.Uuid
+  job       Job      @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  // File location — relative path under STORAGE_DIR
+  storageKey String @map("storage_key")
+
+  // Media metadata (filled during/after extraction)
+  sizeBytes     BigInt? @map("size_bytes")
+  durationSec   Int?    @map("duration_sec")
+  sampleRateHz  Int?    @map("sample_rate_hz")
+  channels      Int?
+  codec         String?
+  bitrateKbps   Int?    @map("bitrate_kbps")
+
+  // Status: pending | extracting | ready | failed
+  status       String @default("pending")
+  progress     Int    @default(0) // 0-100 during extraction
+  errorCode    String? @map("error_code")
+  errorMessage String? @map("error_message")
+
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  startedAt   DateTime? @map("started_at") @db.Timestamptz()
+  readyAt     DateTime? @map("ready_at") @db.Timestamptz()
+
+  @@index([status])
+  @@map("audios")
+}
+
+// One-to-one per job — the Whisper transcript of the extracted audio.
+// Stage 3 of the pipeline creates this row.
+model Transcript {
+  id        String   @id @default(uuid()) @db.Uuid
+  jobId     String   @unique @map("job_id") @db.Uuid
+  job       Job      @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  // Status: pending | transcribing | ready | failed
+  status   String @default("pending")
+  progress Int    @default(0) // 0-100 across audio chunks
+
+  // Whisper-derived metadata (filled when status == "ready")
+  language    String?
+  wordCount   Int?    @map("word_count")
+  durationSec Int?    @map("duration_sec")
+
+  // Full plain-text transcript (joined across chunks)
+  rawText      String? @map("raw_text")
+  // Relative path under STORAGE_DIR pointing at the words.json with timestamps
+  wordsJsonKey String? @map("words_json_key")
+
+  errorCode    String? @map("error_code")
+  errorMessage String? @map("error_message")
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  startedAt DateTime? @map("started_at") @db.Timestamptz()
+  readyAt   DateTime? @map("ready_at") @db.Timestamptz()
+
+  @@index([status])
+  @@map("transcripts")
+}
+
+// One row per (job, cleanLevel) — at most 3 cleaned versions per job
+// (light, standard, aggressive). Re-cleaning at the same level overwrites
+// that level's row so the UI can flip between levels instantly.
+model CleanedTranscript {
+  id    String @id @default(uuid()) @db.Uuid
+  jobId String @map("job_id") @db.Uuid
+  job   Job    @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  // Status: pending | cleaning | ready | failed
+  status   String @default("pending")
+  progress Int    @default(0) // 0-100 across chunks
+
+  // The strictness level this row was cleaned at.
+  cleanLevel String @map("clean_level") // light|standard|aggressive
+
+  // Outputs (filled when status == "ready")
+  cleanedText     String? @map("cleaned_text")
+  cleanedWordsKey String? @map("cleaned_words_key") // path to cleaned_words.json
+  removedJsonKey  String? @map("removed_json_key")  // path to removed_segments.json
+
+  // Stats
+  originalWords   Int? @map("original_words")
+  cleanedWords    Int? @map("cleaned_words")
+  removedSegments Int? @map("removed_segments_count")
+  removedDurSec   Int? @map("removed_dur_sec")
+
+  errorCode    String? @map("error_code")
+  errorMessage String? @map("error_message")
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  startedAt DateTime? @map("started_at") @db.Timestamptz()
+  readyAt   DateTime? @map("ready_at") @db.Timestamptz()
+
+  @@unique([jobId, cleanLevel])
+  @@index([jobId])
+  @@index([status])
+  @@map("cleaned_transcripts")
+}
+
+// One row per (job, cleanLevel, targetMin) — Stage 5 GPT-4o segmentation.
+// Multiple combinations can coexist so the user can compare e.g. Standard
+// at 20 min vs Aggressive at 15 min without re-running.
+model SegmentRun {
+  id    String @id @default(uuid()) @db.Uuid
+  jobId String @map("job_id") @db.Uuid
+  job   Job    @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  // Which cleaned source this run was based on, and the target chunk size.
+  cleanLevel String @map("clean_level") // light|standard|aggressive
+  targetMin  Int    @map("target_min")  // 5..60
+
+  // Status: pending | segmenting | ready | failed
+  status   String @default("pending")
+  progress Int    @default(0)
+
+  // Stats (filled when ready)
+  chunkCount     Int? @map("chunk_count")
+  totalWordCount Int? @map("total_word_count")
+  // Path to chunks.json (denormalized convenience for Step 6 + downloads)
+  chunksJsonKey  String? @map("chunks_json_key")
+
+  errorCode    String? @map("error_code")
+  errorMessage String? @map("error_message")
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  startedAt DateTime? @map("started_at") @db.Timestamptz()
+  readyAt   DateTime? @map("ready_at") @db.Timestamptz()
+
+  chunks Chunk[]
+
+  @@unique([jobId, cleanLevel, targetMin])
+  @@index([jobId])
+  @@index([status])
+  @@map("segment_runs")
+}
+
+// One row per topic chunk produced by a SegmentRun. Edits (rename / merge /
+// split) operate on these rows directly so changes survive page refresh.
+model Chunk {
+  id           String     @id @default(uuid()) @db.Uuid
+  segmentRunId String     @map("segment_run_id") @db.Uuid
+  segmentRun   SegmentRun @relation(fields: [segmentRunId], references: [id], onDelete: Cascade)
+
+  // 0-based ordering within the parent run. Re-numbered after merge/split.
+  idx Int
+
+  topic     String
+  preview   String
+  startSec  Int     @map("start_sec")
+  endSec    Int     @map("end_sec")
+  wordCount Int     @map("word_count")
+  // The actual transcript slice for this chunk — what Step 6 sends to HeyGen.
+  text      String?
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz()
+
+  @@unique([segmentRunId, idx])
+  @@index([segmentRunId])
+  @@map("chunks")
+}

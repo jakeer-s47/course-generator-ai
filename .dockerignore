@@ -1,0 +1,54 @@
+# Keep the build context tiny — Docker copies these into the daemon
+# before the build starts, so excluding heavy/irrelevant directories
+# saves seconds on every `docker build`.
+
+# Node deps — re-installed clean inside the image
+**/node_modules
+
+# Next.js build output — re-built inside the image
+web/.next
+web/out
+
+# User uploads — persisted via the volume mount, not baked into image
+web/uploads
+web/uploads/*
+
+# Local-only env (secrets!)
+.env
+.env.local
+.env.*.local
+**/.env
+**/.env.local
+
+# Editor + OS metadata
+.vscode
+.idea
+.DS_Store
+**/*.swp
+**/*~
+
+# Git internals
+.git
+.gitignore
+.gitattributes
+
+# Python venv — image installs deps fresh
+python/.venv
+python/__pycache__
+**/__pycache__
+
+# Logs & local debug output
+**/*.log
+**/npm-debug.log*
+**/yarn-debug.log*
+**/yarn-error.log*
+
+# Docs that don't belong in the image
+**/*.md
+!web/CLAUDE.md
+!web/AGENTS.md
+PLAN.md
+
+# Tests / coverage / IDE
+coverage
+.next-env.d.ts

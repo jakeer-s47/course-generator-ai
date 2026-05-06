@@ -1,0 +1,63 @@
+# ─── env files ────────────────────────────────────────────────────────
+# .env at project root is read by docker compose — keep it local only,
+# the .env.docker.example template tells contributors what to fill in.
+.env
+.env.local
+.env.*.local
+*.env.local
+
+# ─── Python ───────────────────────────────────────────────────────────
+# venv lives in python/.venv but never gets committed — Dockerfile
+# installs deps fresh from requirements.txt at build time.
+python/.venv/
+**/.venv/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ─── faster-whisper / Hugging Face caches ────────────────────────────
+# Models can be 150 MB - 3 GB; never commit. Docker stores them in a
+# named volume so container rebuilds keep the cache.
+.cache/huggingface/
+hf_cache/
+
+# ─── User uploads (audio + transcripts + chunks) ─────────────────────
+# Generated at runtime; bind-mounted into the web container in compose.
+web/uploads/
+!web/uploads/.gitkeep
+
+# ─── Node ─────────────────────────────────────────────────────────────
+node_modules/
+**/node_modules/
+.pnpm-store/
+
+# ─── Next.js build output ────────────────────────────────────────────
+.next/
+**/.next/
+out/
+
+# ─── Logs ─────────────────────────────────────────────────────────────
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ─── IDE / editor metadata ───────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*~
+
+# ─── Claude Code local state ─────────────────────────────────────────
+.claude/
+
+# ─── OS metadata ─────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ─── Coverage / tsbuild ──────────────────────────────────────────────
+coverage/
+*.tsbuildinfo

@@ -5,6 +5,7 @@ import { prisma } from "@/lib/db";
 import { absPathFor, chunksJsonKey } from "@/lib/storage";
 import { getSessionId } from "@/lib/session";
 import { segmentTranscript, type WordEntry } from "@/lib/segmenter";
+import { findDuplicates, type CandidateChunk } from "@/lib/dedupe";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -248,6 +249,10 @@ export async function POST(
       0,
       (job.sourceDurationSec ?? 0) - (cleanedRow.removedDurSec ?? 0),
     ),
+    // Forward parent-job id so the runner can decide whether to run the
+    // cross-video dedup pass. NULL for standalone single-video jobs —
+    // dedup is skipped entirely and behavior is unchanged from before.
+    parentJobId: job.parentJobId,
   }).catch((err) => console.error("[segment] background crashed", err));
 
   return NextResponse.json(runRow, { status: 202 });
@@ -260,8 +265,12 @@ export async function runSegmentation(params: {
   targetMin: number;
   cleanedWordsKey: string;
   totalDurationSec: number;
+  // Set for child jobs (kind=playlist_video / batch_file). NULL for
+  // standalone jobs — when NULL, the cross-video dedup pass is skipped.
+  parentJobId?: string | null;
 }) {
-  const { jobId, runId, cleanLevel, targetMin, cleanedWordsKey } = params;
+  const { jobId, runId, cleanLevel, targetMin, cleanedWordsKey, parentJobId } =
+    params;
 
   try {
     const wordsAbs = absPathFor(cleanedWordsKey);
@@ -327,19 +336,93 @@ export async function runSegmentation(params: {
       "utf8",
     );
 
+    // ----- Cross-video dedup (child jobs only) -----
+    // Best-effort: errors here MUST NOT fail the segmentation step. If the
+    // GPT call throws, we log + insert chunks without dedup metadata so
+    // the user still gets their result.
+    let dedupByIdx = new Map<
+      number,
+      { canonicalId: string; reason: string }
+    >();
+    if (parentJobId && result.chunks.length > 0) {
+      try {
+        // Pull canonical chunks from every sibling job under the same
+        // parent (excluding ourselves). "Canonical" = duplicateOfChunkId
+        // is null. Other clean-level / target-min runs from siblings ARE
+        // included — a topic is the same topic regardless of which run
+        // surfaced it, and the user picked one source/target combo per
+        // child anyway.
+        const siblingChunks = await prisma.chunk.findMany({
+          where: {
+            duplicateOfChunkId: null,
+            segmentRun: {
+              job: {
+                parentJobId,
+                NOT: { id: jobId },
+              },
+            },
+          },
+          select: { id: true, topic: true, preview: true },
+          // Hard cap: a course with hundreds of canonical chunks would
+          // blow the prompt. Take the most recent — those are most
+          // likely the videos the user is working on.
+          orderBy: { createdAt: "desc" },
+          take: 200,
+        });
+
+        if (siblingChunks.length > 0) {
+          const siblingCandidates: CandidateChunk[] = siblingChunks.map((s) => ({
+            id: s.id,
+            topic: s.topic,
+            preview: s.preview,
+          }));
+          const newCandidates: CandidateChunk[] = result.chunks.map((c) => ({
+            id: "", // not used for new chunks; matched by index
+            topic: c.topic,
+            preview: c.preview,
+          }));
+
+          const matches = await findDuplicates({
+            newChunks: newCandidates,
+            siblingChunks: siblingCandidates,
+          });
+
+          dedupByIdx = new Map(
+            matches.map((m) => [
+              m.newIdx,
+              { canonicalId: m.canonicalId, reason: m.reason },
+            ]),
+          );
+        }
+      } catch (err) {
+        // Swallow — dedup is opt-in metadata. The segmentation step
+        // still produces chunks; the UI just won't show duplicate badges
+        // for this run. Log so it's visible in server output.
+        const message = err instanceof Error ? err.message : String(err);
+        console.warn(
+          `[segment] dedup skipped for job ${jobId} (parent ${parentJobId}): ${message}`,
+        );
+      }
+    }
+
     // Insert chunks one batch.
     if (result.chunks.length > 0) {
       await prisma.chunk.createMany({
-        data: result.chunks.map((c, idx) => ({
-          segmentRunId: runId,
-          idx,
-          topic: c.topic,
-          preview: c.preview,
-          startSec: c.startSec,
-          endSec: c.endSec,
-          wordCount: c.wordCount,
-          text: c.text,
-        })),
+        data: result.chunks.map((c, idx) => {
+          const dup = dedupByIdx.get(idx);
+          return {
+            segmentRunId: runId,
+            idx,
+            topic: c.topic,
+            preview: c.preview,
+            startSec: c.startSec,
+            endSec: c.endSec,
+            wordCount: c.wordCount,
+            text: c.text,
+            duplicateOfChunkId: dup?.canonicalId ?? null,
+            duplicateReason: dup?.reason ?? null,
+          };
+        }),
       });
     }
 

@@ -25,6 +25,7 @@ import {
   Scale,
   Flame,
   X,
+  Copy,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { useWizard, type CleanLevel, type TopicChunk } from "../WizardContext";
@@ -68,6 +69,16 @@ type ChunkRow = {
   endSec: number;
   wordCount: number;
   text: string | null;
+  // Cross-video dedup fields. Populated only for child jobs of a playlist
+  // / batch parent — null for standalone single-video jobs.
+  duplicateOfChunkId?: string | null;
+  duplicateReason?: string | null;
+  duplicateOf?: {
+    id: string;
+    topic: string;
+    jobId: string;
+    sourceName: string;
+  } | null;
 };
 
 type JobRowMinimal = {
@@ -1436,8 +1447,12 @@ function ChunksAccordion({
       {chunks.map((c, i) => {
         const open = openId === c.id;
         const duration = c.endSec - c.startSec;
+        const isDuplicate = !!c.duplicateOfChunkId;
         return (
-          <div key={c.id} className="transition-colors">
+          <div
+            key={c.id}
+            className={`transition-colors ${isDuplicate ? "bg-amber-50/30" : ""}`}
+          >
             <button
               type="button"
               onClick={() => onToggleOpen(c.id)}
@@ -1448,7 +1463,9 @@ function ChunksAccordion({
               }`}
             >
               <span
-                className="flex items-center justify-center w-9 h-9 rounded-xl text-white text-[15px] font-semibold shrink-0 nums shadow-[inset_0_1px_0_rgba(255,255,255,0.2),_0_4px_10px_-2px_rgba(15,23,42,0.3)]"
+                className={`flex items-center justify-center w-9 h-9 rounded-xl text-white text-[15px] font-semibold shrink-0 nums shadow-[inset_0_1px_0_rgba(255,255,255,0.2),_0_4px_10px_-2px_rgba(15,23,42,0.3)] ${
+                  isDuplicate ? "grayscale opacity-60" : ""
+                }`}
                 style={{
                   backgroundImage: `linear-gradient(135deg, hsl(${(i * 55) % 360} 72% 55%), hsl(${(i * 55 + 35) % 360} 72% 45%))`,
                 }}
@@ -1480,10 +1497,28 @@ function ChunksAccordion({
                     className="w-full px-2 py-1 text-[17px] font-semibold text-slate-900 bg-white border border-indigo-500 rounded-md focus:outline-none focus:ring-2 focus:ring-indigo-100"
                   />
                 ) : (
-                  <span className="text-[17px] font-semibold text-slate-900 truncate block">
+                  <span
+                    className={`text-[17px] font-semibold truncate block ${
+                      isDuplicate ? "text-slate-500" : "text-slate-900"
+                    }`}
+                  >
                     {c.topic}
                   </span>
                 )}
+                {isDuplicate && c.duplicateOf ? (
+                  <span
+                    className="mt-1 inline-flex items-center gap-1.5 text-[12px] font-medium text-amber-700 bg-amber-100 border border-amber-200 rounded-md px-2 py-0.5 max-w-full"
+                    title={c.duplicateReason ?? undefined}
+                  >
+                    <Copy size={11} strokeWidth={2.25} className="shrink-0" />
+                    <span className="truncate">
+                      Same topic as &ldquo;{c.duplicateOf.topic}&rdquo;
+                      {c.duplicateOf.sourceName
+                        ? ` · ${c.duplicateOf.sourceName}`
+                        : ""}
+                    </span>
+                  </span>
+                ) : null}
               </span>
               <span className="hidden md:flex items-center gap-3 text-[13.5px] text-slate-500 shrink-0">
                 <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-slate-50 border border-slate-200">

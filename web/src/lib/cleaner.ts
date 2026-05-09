@@ -32,7 +32,9 @@ export type RemovedCategory =
   | "tangent"
   | "recap"
   | "redundant"
-  | "falsestart";
+  | "falsestart"
+  | "social"
+  | "discussion";
 
 export type RemovedSegment = {
   start_sec: number;
@@ -76,6 +78,8 @@ const SCHEMA = {
               "recap",
               "redundant",
               "falsestart",
+              "social",
+              "discussion",
             ],
           },
           reason: { type: "string" },
@@ -120,67 +124,224 @@ function buildTimestampedLines(words: WordEntry[], bucketSec = 10): string {
 function systemPrompt(level: CleanLevel): string {
   const allowed: Record<CleanLevel, string> = {
     light: "filler, falsestart",
-    standard: "filler, falsestart, admin, tangent",
-    aggressive: "filler, falsestart, admin, tangent, recap, redundant",
+    standard: "filler, falsestart, admin, tangent, social",
+    aggressive:
+      "filler, falsestart, admin, tangent, recap, redundant, social, discussion",
   };
 
   // Tone hint per level. Light errs heavily on the side of keep; aggressive
-  // is allowed to remove even useful-but-redundant content.
+  // is allowed to remove every non-teaching span, including Socratic Q&A
+  // and student-instructor discussion blocks. The output should read like
+  // a polished tutorial monologue.
   const tone: Record<CleanLevel, string> = {
     light:
       "Be VERY conservative. Remove only obvious verbal stumbles. If a phrase has any teaching value, KEEP IT.",
     standard:
       "Balanced editing. Remove housekeeping and clear off-topic asides, but preserve all instructional content.",
     aggressive:
-      "Tight editing for a polished version. Drop content that's already been covered, even when phrased differently.",
+      "EXTRACT-ONLY-TECHNICAL mode. The source is a recorded live online class with massive amounts of non-teaching chatter. The DEFAULT BEHAVIOR IS TO REMOVE. The output must read like a polished written textbook chapter — only the instructor's continuous monologues delivering definitions, derivations, worked examples, code walkthroughs, and analogies survive. Every other utterance — audio checks, reconnect noise, screen-share coordination, roll call, comprehension checks, Socratic questions, student responses, compliments, debug interludes, end-of-session housekeeping, future-session planning, goodbyes — gets removed. When you cannot decide whether a span is teaching or not, REMOVE IT. False negatives (kept noise) are worse than false positives (lost content) at this level.",
   };
 
-  return `You clean instructional lecture transcripts by identifying spans the listener should NOT hear.
+  return `You clean instructional lecture transcripts by identifying spans the listener should NOT hear. The source is often a RECORDED LIVE ONLINE CLASS, so the raw transcript contains a lot of non-teaching meta-conversation that the final viewer should never hear: audio checks, reconnect chatter, roll call, student questions and responses, apologies for technical issues, pleasantries between instructor and students. Your job is to surface those spans so the backend can drop them, leaving ONLY the instructor's actual teaching.
 
 CATEGORIES (use ONLY these):
 - filler — "um/uh/like/you know", stutters, hesitations
 - falsestart — incomplete or restarted sentences
-- admin — schedule notes, "let me check the time", roll call, housekeeping
+- admin — class housekeeping AND tech/audio/screen coordination. Includes:
+    · schedule + assignment notes ("submit by Friday", "let me check the time")
+    · roll call / attendance ("is everyone here", "let me wait 2 more minutes")
+    · audio checks ("can you hear me", "is my mic working", "is the audio okay")
+    · screen-share coordination ("can you see my screen", "let me zoom in", "is this visible")
+    · connection / reconnect noise ("internet issue", "I had to reconnect", "did you hear that part", "should I repeat")
+    · platform talk ("the recording started", "I'll post this on the LMS")
 - tangent — off-topic anecdotes, side conversations, jokes unrelated to the topic
+- social — pleasantries and interpersonal exchanges that aren't teaching:
+    · greetings + farewells ("hi everyone", "see you tomorrow", "good morning")
+    · apologies / thanks ("sorry for the delay", "thanks for joining", "appreciate the patience")
+    · acknowledgements ("yeah okay", "right right", "got it", "no problem")
+    · instructor compliments to students ("excellent", "very nice", "very well articulated", "perfect", "good answer", "nice nice")
+    · roll-call by name ("Amiska, are you there", "any other members? Money, Rakesh, Abhigna?")
+- discussion — Socratic Q&A and student-instructor dialogue blocks. AT AGGRESSIVE LEVEL, treat the WHOLE Q&A block as removable, even when student answers contain partially-correct technical content. The instructor will (or already has) deliver the proper definition elsewhere — the discussion itself doesn't belong in a polished tutorial. Includes:
+    · instructor prompts that solicit student input ("how do you define X?", "tell me what is an agent", "can we discuss any example?", "would you like to define X?", "any other definitions?", "can someone give me a real-life example?")
+    · student attempts and partial definitions, even when they contain technical words
+    · instructor recaps of student answers ("so you're saying it's a smart assistant", "very well articulated")
+    · comprehension checks ("is it clear or not clear?", "any doubts?", "clear?", "tell me why?", "got it?")
+    · short alternating turns where multiple speakers throw definitions or examples back and forth
 - recap — explicit "as I told you before…" repetition of already-covered material
 - redundant — clearly restated content within the same paragraph
 
 NEVER REMOVE:
 - definitions, derivations, worked examples
-- code, syntax, commands, technical terminology
-- instructional transitions ("now let's look at…", "the next thing is…")
+- code, syntax, commands, technical terminology, equations
+- instructional transitions that introduce content ("now let's look at…", "the next thing is…")
 - analogies or examples that illustrate the concept
+- the instructor's ANSWER to a student's question, when that answer contains technical content (the question itself can go under social if it's just "any doubts?", but the answer stays)
 - anything where the speaker is teaching, explaining, or demonstrating
 
 EXAMPLES (good vs. bad removals):
 
 Example 1 — KEEP (instructional transition):
   "[03:21] Now let's look at how variables work in JavaScript."
-  → DO NOT remove. This is a transition into teaching content.
+  → DO NOT remove. Transition into teaching content.
 
 Example 2 — REMOVE (filler):
   "[03:24] So, um, you know, like a variable is, uh, a container."
-  → Remove just "um, you know, like" and "uh" — keep the definition.
-  → category: filler  reason: stutters around definition
+  → Remove "um, you know, like" and "uh" — keep the definition.
+  → category: filler
 
-Example 3 — REMOVE (admin) at standard+:
-  "[12:05] Hey before we continue, the assignment is due Friday at 5pm."
-  → Remove the whole sentence.
-  → category: admin  reason: assignment deadline note
+Example 3 — REMOVE (admin: live-class tech check):
+  "[00:12] Yeah, I can hear you well now. Sorry for asking you to repeat this third time, but there was an internet issue."
+  → Remove the whole span.
+  → category: admin  reason: audio check + connection apology
 
-Example 4 — KEEP at standard, REMOVE at aggressive (recap):
+Example 4 — REMOVE (social: roll call / acknowledgement):
+  "[01:05] I'm in the first row, I was able to hear good. Yeah okay, good morning everyone."
+  → Remove the whole span. None of this is teaching.
+  → category: social  reason: roll call response and greeting
+
+Example 5 — REMOVE (admin: screen-share coordination):
+  "[14:30] Can you all see my screen? Let me zoom in a bit. Is this visible at the back?"
+  → Remove the whole span.
+  → category: admin  reason: screen-share coordination
+
+Example 6 — REMOVE (social: student banter that adds no content):
+  "[22:10] Rahul, are you there? Yeah good. Okay, anyone else have a question? No? Alright."
+  → Remove the whole span.
+  → category: social  reason: student check-in, no instructional content
+
+Example 7 — REMOVE WHOLE Q&A BLOCK at aggressive (discussion):
+  Instructor: "[18:00] How do you define something as an agent? Tell me."
+  Student A:  "[18:05] It acts and learns and observes."
+  Instructor: "[18:09] Nice nice. Any other definition friends?"
+  Student B:  "[18:13] Agent is like a smart assistant that can think and act on its own."
+  Instructor: "[18:18] Excellent, very well articulated. Any other members?"
+  Student C:  "[18:23] The chatbot that books a flight, it's an agent."
+  Instructor: "[18:27] Excellent, that is also one of the best examples."
+  → REMOVE the ENTIRE block 18:00–18:30. The instructor will deliver the
+    actual definition right after this. Even the student answers, even the
+    technical-sounding ones, are part of a Socratic dialogue that doesn't
+    belong in a polished tutorial.
+  → category: discussion  reason: Socratic Q&A on agent definition
+
+Example 8 — KEEP (the instructor's authoritative definition that follows):
+  "[18:30] Mug up this word: autonomous. An agent is an autonomous, goal-driven component which uses memory and reasoning capability to take decisions."
+  → KEEP. This is the instructor's actual teaching content.
+
+Example 9 — REMOVE (admin: live-class screen-share + reconnect):
+  "[02:40] I'm sorry friend, I'm back. Can you hear me well now? Okay, now I'm on desktop, not laptop. Let me share my screen and we will take the steps further. Hold on. Let me know when you can see Visual Studio. Can you see my Visual Studio screen now?"
+  → Remove the whole span. Pure live-class meta.
+  → category: admin  reason: reconnect + screen-share coordination
+
+Example 10 — REMOVE (discussion: comprehension check):
+  "[35:14] Is it clear or not clear? Clear? Any doubts? Tell me why."
+  → Remove the whole span.
+  → category: discussion  reason: comprehension check
+
+Example 11 — REMOVE (admin: assignment / scheduling):
+  "[12:05] Before we continue, the assignment is due Friday at 5 pm. Submit on the LMS."
+  → Remove. category: admin
+
+Example 12 — KEEP at standard, REMOVE at aggressive (recap):
   "[28:10] As I mentioned earlier, JavaScript is dynamic, meaning..."
-  → "As I mentioned earlier" is a recap signal. At aggressive, remove the
-    full restatement; at standard, keep it (the listener may have skipped).
+  → "As I mentioned earlier" is a recap signal. At aggressive, remove the full restatement; at standard, keep it (the listener may have skipped).
 
-Example 5 — KEEP (analogy, not tangent):
+Example 13 — KEEP (analogy, not tangent):
   "[15:40] Think of an object like a box with labelled compartments."
-  → DO NOT remove. Analogies illustrating the concept are teaching content.
+  → DO NOT remove. Analogies illustrating the concept ARE teaching content.
+
+Example 14 — KEEP (worked example, even if it sounds informal):
+  "[25:00] Suppose I am trying to withdraw money from my bank account. I have a 10,000 balance and I tell the cashier, please give me 15,000. The cashier will not give me the money because the cashier has the knowledge to check the balance. This is reasoning capability."
+  → KEEP. This is a worked example illustrating the concept of reasoning. Even though the instructor uses informal phrasing, the content is teaching.
+
+Example 15 — REMOVE (admin: end-of-session homework / mock-interview chatter):
+  "[88:20] If you do not have any difficulties, can you tell me if you have any challenges in practicing interview questions? Many members have written complex interview questions. How are you understanding it? Can we have some mock interview starting next week?"
+  → Remove the entire span. End-of-session housekeeping, no teaching content.
+  → category: admin
+
+Example 16 — REMOVE (admin: debug interlude / postponement):
+  "[80:00] So one moment, let me see the version actually. So I have 1.9.7. This should be okay. This is a 2.6 so I am on the latest version. I will check on this part and get back to you actually on this environment. I will have that list ready for you tomorrow."
+  → Remove the whole span. Instructor stopped teaching to debug an environment issue and postponed it. Nothing the listener can learn from.
+  → category: admin  reason: debug interlude + postponement
+
+Example 17 — REMOVE (admin: future-session planning + goodbyes):
+  "[91:50] Then let us take a pause for today and we will meet tomorrow at 9:30. Sure okay thanks friends. Thank you. Hello, can you hear me? Yes sir. Okay, if you have any doubts let me know. Thank you so much."
+  → Remove the entire span. Pure end-of-session housekeeping + goodbyes.
+  → category: admin  reason: session close + goodbyes
+
+Example 18 — REMOVE (discussion: instructor recapping student answer):
+  "[18:00] Perfect and very nice very well articulated. Any other members? Money, Rakesh, Abhigna, would you like to define what is an agent based on your understanding?"
+  → Remove. Pure compliment + roll call.
+  → category: discussion  reason: compliment and roll call after student answer
+
+Example 19 — KEEP (continuous teaching monologue, multi-sentence definition):
+  "[20:00] Mug up this word: autonomous. An agent is an autonomous goal-driven component which uses memory and reasoning capability. Autonomous means self-growing, self-learning, self-operating. Goal-driven means it has certain benchmarks to recognize whether the output is correct or incorrect — if incorrect, feedback cycle improves it; if correct, maintain. Memory means the conversation memory and the context being passed. Reasoning capability is how the agent fixes the decision based on rules and context."
+  → KEEP. Continuous instructor monologue delivering the definition.
+
+Example 20 — KEEP (worked example with multiple agents):
+  "[45:00] We will have a customer support agent. Its role is to collect customer details and documents. Then a document validator agent that verifies the documents and does eKYC. Then a credit history agent that fetches the CIBIL score. Then a risk assessment agent that calculates risk from documents and score. Then a decision agent that approves or rejects the loan based on rules. Then a communication agent that tells the customer the status. Last, a compliance agent that ensures regulatory adherence."
+  → KEEP. Continuous teaching monologue delivering the multi-agent example.
+
+LIVE-CLASS RULE OF THUMB:
+If a span only makes sense BECAUSE the class is happening live (audio coordination, reconnect noise, "are you all there", "should I move on"), it's removable. The polished avatar-narrated output should sound like a tutorial recording, not a Zoom call.
+
+AGGRESSIVE-ONLY: SOCRATIC Q&A REMOVAL
+If you see a clear pattern of:
+  (a) instructor asking students to define / give an example ("how do you define X?", "can someone give me an example?", "tell me what is an agent")
+  (b) followed by ONE OR MORE short responses with informal definitions or examples
+  (c) followed by instructor compliments ("excellent", "nice", "very well articulated")
+  (d) eventually followed by the instructor's own authoritative explanation
+…REMOVE (a)(b)(c) — keep only (d). Even when student answers contain technically correct words, they're not the polished teaching content the final viewer should hear. The instructor's monologue in (d) carries the actual lesson.
+
+SESSION BOUNDARIES (AGGRESSIVE — REMOVE):
+Live-class recordings always have non-teaching content at the start AND end of the file. REMOVE these aggressively:
+
+OPENING (typically the first 1-3 minutes — REMOVE):
+  · "Can you hear me?", "Is my audio working?", "I had an internet issue"
+  · Reconnect noise: "I'm back", "Sorry I had to switch from laptop to desktop"
+  · Roll call: "Are we all here?", "Amiska, did I need to repeat?"
+  · Greetings: "Hi everyone, good morning"
+  · Recap pings: "Did you go through the recordings? Any difficulties?"
+
+CLOSING (typically the last 1-3 minutes — REMOVE):
+  · Future session planning: "We'll meet tomorrow at 9:30", "Let's take a pause for today"
+  · Mock interview / homework chatter: "How are you working on interview questions?", "Any difficulties in generators or decorators?"
+  · Off-topic Q&A: "What about FastAPI?", "Are you practicing?"
+  · Debug postponements: "I'll check this and get back to you tomorrow", "Let me fix the version and show you a working example"
+  · Goodbyes: "Thank you", "See you tomorrow", "Hello can you hear me?", "Take care", multiple "thank you"s in sequence
+
+DEBUG / SETUP INTERLUDES (REMOVE):
+When the instructor stops teaching to fix a technical problem (wrong package version, missing variable, broken code), those minutes are NOT teaching content. Examples:
+  · "I'm getting this error, let me check the version"
+  · "One moment, let me see the environment"
+  · "This is a 2.6, looks like the latest. Let me debug."
+  · "I'll have a list ready for you tomorrow"
+  → All REMOVE (category: admin) UNLESS the instructor narrates a debugging technique that's itself the lesson.
+
+DEFAULT BIAS FOR LIVE-CLASS RECORDINGS AT AGGRESSIVE:
+DEFAULT IS REMOVE. The only spans that survive are continuous instructor monologues delivering teaching content. Specifically, KEEP when ALL of these are true:
+  · ≥ 3 sentences of the instructor speaking continuously
+  · Content is a definition, derivation, worked example, code walkthrough, analogy, or step-by-step demonstration
+  · The listener could learn the topic from the span without context from removed surrounding turns
+
+REMOVE when ANY of these are true:
+  · Short turns alternating between speakers (≤ 2 sentences each)
+  · Instructor compliments / acknowledgements ("excellent", "nice", "very well articulated", "perfect")
+  · Comprehension checks ("clear?", "any doubts?", "tell me why?", "got it?")
+  · Audio / screen / connection talk
+  · Roll call or addressing students by name
+  · Future-session planning, mock-interview talk, homework discussions
+  · Debug interludes where the lesson is not actually being delivered
+  · Goodbyes, greetings, thank-yous
+  · Socratic Q&A blocks even when student answers contain technical words
 
 STRICTNESS LEVEL: ${level}
 ${tone[level]}
 For this run, only emit segments whose category is one of: ${allowed[level]}.
-If a span doesn't clearly fit one of those categories at this level, DO NOT remove it. When in doubt, KEEP IT.
+${
+  level === "aggressive"
+    ? "AT AGGRESSIVE: when in doubt, REMOVE. The output must read like a single instructor's polished written tutorial. The reader should never know this came from a live class."
+    : 'If a span doesn\'t clearly fit one of those categories at this level, DO NOT remove it. When in doubt, KEEP IT — but for live-class recordings at standard, be willing to remove every meta-conversation span you can clearly attribute to admin or social.'
+}
 
 SPAN BOUNDARIES:
 - Prefer boundaries that align with sentence or clause endings. Do NOT cut mid-clause unless the entire clause is a removal candidate.

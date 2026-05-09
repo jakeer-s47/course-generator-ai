@@ -235,10 +235,25 @@ model Chunk {
   // The actual transcript slice for this chunk — what Step 6 sends to HeyGen.
   text      String?
 
+  // Cross-video deduplication (only populated for child jobs of a batch /
+  // playlist parent). When NULL, this chunk is canonical (or the job is a
+  // standalone single-video job and dedup never ran). When set, points at
+  // a Chunk in a sibling job that this one is a duplicate of — Step 6
+  // skips rendering by default and the UI shows a "same as …" badge.
+  // SetNull on delete: if the canonical's segment run gets re-segmented,
+  // this row becomes canonical itself rather than referencing a stale id.
+  duplicateOfChunkId String? @map("duplicate_of_chunk_id") @db.Uuid
+  duplicateOf        Chunk?  @relation("ChunkDuplicates", fields: [duplicateOfChunkId], references: [id], onDelete: SetNull)
+  duplicates         Chunk[] @relation("ChunkDuplicates")
+  // GPT-4o's one-line reason for the match — surfaced as a tooltip in the
+  // duplicate badge. NULL when the chunk is canonical.
+  duplicateReason    String? @map("duplicate_reason")
+
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz()
   updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz()
 
   @@unique([segmentRunId, idx])
   @@index([segmentRunId])
+  @@index([duplicateOfChunkId])
   @@map("chunks")
 }

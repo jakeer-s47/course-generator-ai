@@ -60,11 +60,58 @@ export async function GET(
         targetMin,
       },
     },
-    include: { chunks: { orderBy: { idx: "asc" } } },
+    include: {
+      chunks: {
+        orderBy: { idx: "asc" },
+        // For chunks marked as duplicates of a sibling-job chunk, also pull
+        // the canonical's topic so the UI can render "Same as 'X'" without
+        // a second fetch. The canonical lives in a different SegmentRun
+        // (and a different Job), but Prisma's self-relation handles it.
+        include: {
+          duplicateOf: {
+            select: {
+              id: true,
+              topic: true,
+              segmentRun: {
+                select: {
+                  jobId: true,
+                  job: { select: { sourceName: true } },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
   });
   if (!run) {
     return NextResponse.json({ error: "No segment run" }, { status: 404 });
   }
+
+  // Flatten the duplicateOf relation into a small object the UI can read
+  // directly. We don't expose the full nested include to keep the API
+  // payload tight and stable.
+  const chunks = run.chunks.map((c) => ({
+    id: c.id,
+    segmentRunId: c.segmentRunId,
+    idx: c.idx,
+    topic: c.topic,
+    preview: c.preview,
+    startSec: c.startSec,
+    endSec: c.endSec,
+    wordCount: c.wordCount,
+    text: c.text,
+    duplicateOfChunkId: c.duplicateOfChunkId,
+    duplicateReason: c.duplicateReason,
+    duplicateOf: c.duplicateOf
+      ? {
+          id: c.duplicateOf.id,
+          topic: c.duplicateOf.topic,
+          jobId: c.duplicateOf.segmentRun.jobId,
+          sourceName: c.duplicateOf.segmentRun.job.sourceName,
+        }
+      : null,
+  }));
 
   return NextResponse.json({
     run: {
@@ -76,6 +123,6 @@ export async function GET(
       chunkCount: run.chunkCount,
       totalWordCount: run.totalWordCount,
     },
-    chunks: run.chunks,
+    chunks,
   });
 }

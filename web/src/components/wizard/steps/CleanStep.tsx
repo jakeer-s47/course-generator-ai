@@ -423,7 +423,12 @@ export function CleanStep() {
   const progress = activeCleaned?.progress ?? 0;
 
   // Has THIS level ever been run? Used to decide whether to show the CTA.
-  const hasActiveRow = activeCleaned !== null;
+  // A `pending` row counts as "not run yet" — it can be left over from
+  // a stale-claim recovery / manual reset. Without this, a pending row
+  // would hide the CTA AND the Re-clean card, leaving the user with no
+  // way to start cleaning.
+  const hasActiveRow =
+    activeCleaned !== null && activeCleaned.status !== "pending";
 
   // Are any other levels currently mid-flight? We block starting another
   // run while one is in progress so we don't double-spend on GPT-4o.

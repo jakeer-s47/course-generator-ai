@@ -57,6 +57,17 @@ export type ChunkRow = {
   startSec: number;
   endSec: number;
   wordCount: number;
+  // Cross-video dedup metadata. Populated by the GPT-4o pass in
+  // runSegmentation for child jobs of a playlist / batch parent.
+  // Optional so single-video flows (which never set them) don't break.
+  duplicateOfChunkId?: string | null;
+  duplicateReason?: string | null;
+  duplicateOf?: {
+    id: string;
+    topic: string;
+    jobId: string;
+    sourceName: string;
+  } | null;
 };
 
 export type CleanLevel = "light" | "standard" | "aggressive";

@@ -365,7 +365,10 @@ async function ensureSegment(
 
   const job = await prisma.job.findUnique({
     where: { id: jobId },
-    select: { sourceDurationSec: true },
+    // parentJobId is forwarded into runSegmentation so the dedup pass
+    // fires for playlist / batch children. NULL for standalone jobs —
+    // dedup skipped there, behavior unchanged.
+    select: { sourceDurationSec: true, parentJobId: true },
   });
   if (!job) return;
 
@@ -432,5 +435,6 @@ async function ensureSegment(
       0,
       (job.sourceDurationSec ?? 0) - (cleaned.removedDurSec ?? 0),
     ),
+    parentJobId: job.parentJobId,
   });
 }

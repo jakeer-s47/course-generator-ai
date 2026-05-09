@@ -12,6 +12,14 @@ import {
   Clock,
   Check,
   AlertTriangle,
+  ChevronDown,
+  Copy,
+  Hash,
+  Sparkles,
+  Layers,
+  Search,
+  Eye,
+  EyeOff,
 } from "lucide-react";
 import { useWizard } from "./WizardContext";
 import { Topbar } from "./Topbar";
@@ -458,18 +466,19 @@ function ChildList({
 
 // ── Unified deduped chunks for Step 5 ──────────────────────────────────
 //
-// Fetches each child's chunks in parallel and merges them into one flat
-// list. When two children produce a chunk with the same topic (case-
-// insensitive, whitespace-trimmed), only the first occurrence in
-// playlist / batch order is kept. That removes the most common form of
-// duplication a multi-video upload tends to produce.
+// Multi-video chunk view. Fetches each child's chunks in parallel and
+// presents them grouped by source video, with explicit dedup metadata
+// from the GPT-4o pass run during runSegmentation. Each row knows
+// whether it's CANONICAL (first time this topic appears across the
+// playlist) or a DUPLICATE pointing at an earlier video's chunk.
 //
-// Each row is a `ChunkRowEditable` from ChildInlineDetail — same
-// expand/edit UX you'd get inside a single child, but the underlying
-// PATCH targets the appropriate child job's chunk endpoint via the
-// jobId passed alongside.
+// Replaces an older flat-list design that did its own client-side
+// case-insensitive string matching to hide duplicates — that approach
+// missed paraphrases ("Variables" vs "Var Declarations") that the
+// GPT pass catches reliably.
 
-type ChunkWithSource = ChunkRow & { jobId: string; sourceName: string };
+type ChildChunkData = ChunkRow[] | "loading" | "none";
+type FilterMode = "all" | "unique" | "duplicates";
 
 function UnifiedChunksView({
   children,
@@ -480,13 +489,16 @@ function UnifiedChunksView({
   cleanLevel: "light" | "standard" | "aggressive";
   targetMin: number;
 }) {
-  const [byChild, setByChild] = useState<
-    Record<string, ChunkRow[] | "loading" | "none">
-  >({});
+  const [byChild, setByChild] = useState<Record<string, ChildChunkData>>({});
+  const [filter, setFilter] = useState<FilterMode>("all");
+  const [search, setSearch] = useState("");
+  const [collapsedVideos, setCollapsedVideos] = useState<Set<string>>(
+    new Set(),
+  );
 
-  // One fetch per child, polled until status flips terminal. Polling is
-  // cheap because most children's chunks endpoints return 404 until split
-  // completes, after which they're cached and we stop polling.
+  // Per-child polling. Stops once we've seen non-loading data, but
+  // keeps a low-frequency tick because the user can re-segment from
+  // another tab and we want fresh data.
   useEffect(() => {
     let cancelled = false;
     const intervals: number[] = [];
@@ -515,14 +527,11 @@ function UnifiedChunksView({
           /* transient — next tick retries */
         }
       };
-      // Initial mark + first fetch.
       setByChild((prev) =>
         prev[c.id] === undefined ? { ...prev, [c.id]: "loading" } : prev,
       );
       void tick();
-      // Poll every 2 s — chunks rarely change post-split, so the cost
-      // is bounded.
-      intervals.push(window.setInterval(tick, 2000));
+      intervals.push(window.setInterval(tick, 3000));
     }
     return () => {
       cancelled = true;
@@ -530,107 +539,233 @@ function UnifiedChunksView({
     };
   }, [children, cleanLevel, targetMin]);
 
-  // Flatten + dedupe in playlist / batch order.
-  const { unique, hiddenCount, totalCount } = useMemo(() => {
-    const seen = new Map<string, ChunkWithSource>();
+  // Aggregate stats across all children. Duplicate detection comes
+  // from the server-side dedup pass (duplicateOfChunkId is non-null).
+  const stats = useMemo(() => {
     let total = 0;
+    let canonical = 0;
+    let duplicate = 0;
+    let totalDur = 0;
+    let canonicalDur = 0;
     for (const child of children) {
       const list = byChild[child.id];
       if (!Array.isArray(list)) continue;
       for (const c of list) {
         total += 1;
-        const key = c.topic.trim().toLowerCase();
-        if (!key) continue;
-        if (!seen.has(key)) {
-          seen.set(key, {
-            ...c,
-            jobId: child.id,
-            sourceName: child.sourceName,
-          });
+        const dur = Math.max(0, c.endSec - c.startSec);
+        totalDur += dur;
+        if (c.duplicateOfChunkId) {
+          duplicate += 1;
+        } else {
+          canonical += 1;
+          canonicalDur += dur;
         }
       }
     }
-    const uniqueArr = Array.from(seen.values());
-    return {
-      unique: uniqueArr,
-      hiddenCount: total - uniqueArr.length,
-      totalCount: total,
-    };
+    return { total, canonical, duplicate, totalDur, canonicalDur };
   }, [children, byChild]);
 
   const stillLoading = children.some(
     (c) => byChild[c.id] === "loading" || byChild[c.id] === undefined,
   );
-  const totalDur = unique.reduce(
-    (sum, c) => sum + (c.endSec - c.startSec),
-    0,
-  );
 
-  if (totalCount === 0 && stillLoading) {
+  // Empty-state shortcuts.
+  if (stats.total === 0 && stillLoading) {
     return (
-      <div className="rounded-xl border border-slate-200 bg-white px-5 py-6 text-center">
+      <div className="rounded-xl border border-slate-200 bg-white px-5 py-10 text-center">
         <Loader2
-          size={18}
+          size={20}
           strokeWidth={2}
           className="inline animate-spin-slow text-slate-400"
         />
         <p className="text-[13px] text-slate-500 mt-2">
-          Waiting for chunks from {children.length} videos…
+          Waiting for chunks from {children.length} video
+          {children.length === 1 ? "" : "s"}…
         </p>
       </div>
     );
   }
-  if (totalCount === 0) {
+  if (stats.total === 0) {
     return (
-      <div className="rounded-xl border border-slate-200 bg-white px-5 py-6 text-center">
-        <p className="text-[13px] text-slate-400 italic">
+      <div className="rounded-xl border border-slate-200 bg-white px-5 py-10 text-center">
+        <Layers
+          size={22}
+          strokeWidth={1.6}
+          className="inline text-slate-300"
+        />
+        <p className="text-[13px] text-slate-500 mt-2">
           No chunks yet. Click <strong>Process all</strong> on Step 3 to
-          run the cascade.
+          run the cascade through segmentation.
         </p>
       </div>
     );
+  }
+
+  const searchLower = search.trim().toLowerCase();
+
+  function toggleVideo(id: string) {
+    setCollapsedVideos((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  function expandAll() {
+    setCollapsedVideos(new Set());
+  }
+  function collapseAll() {
+    setCollapsedVideos(new Set(children.map((c) => c.id)));
   }
 
   return (
     <div className="flex flex-col gap-4">
-      {/* Summary header */}
-      <div className="rounded-xl border border-slate-200 bg-gradient-to-br from-rose-50/40 via-white to-orange-50/30 p-4 flex items-center gap-3 flex-wrap">
-        <div className="flex-1 min-w-[200px]">
-          <p className="text-[14px] font-semibold text-slate-900 leading-tight">
-            {unique.length} unique topic{unique.length === 1 ? "" : "s"}{" "}
-            across {children.length} videos
-          </p>
-          <p className="text-[12px] text-slate-500 mt-0.5 leading-snug">
-            {totalDur > 0 ? `${formatDuration(totalDur)} of content · ` : ""}
-            {hiddenCount > 0 ? (
-              <>
-                <span className="font-medium text-slate-700 nums">
-                  {hiddenCount}
-                </span>{" "}
-                duplicate{hiddenCount === 1 ? "" : "s"} hidden (kept first
-                occurrence)
-              </>
-            ) : (
-              "no duplicates"
-            )}
-          </p>
+      {/* ── Stats card ──────────────────────────────────────────── */}
+      <div className="rounded-2xl border border-slate-200 bg-gradient-to-br from-indigo-50/60 via-white to-fuchsia-50/40 px-5 py-4 shadow-[0_1px_2px_rgba(9,9,11,0.04)]">
+        <div className="flex items-start justify-between gap-4 flex-wrap">
+          <div className="flex-1 min-w-[220px]">
+            <p className="text-[11px] uppercase tracking-wide font-semibold text-indigo-600/80">
+              Course outline
+            </p>
+            <p className="text-[18px] font-semibold text-slate-900 leading-tight mt-0.5">
+              {stats.canonical} unique topic
+              {stats.canonical === 1 ? "" : "s"} across {children.length}{" "}
+              video{children.length === 1 ? "" : "s"}
+            </p>
+            <p className="text-[12.5px] text-slate-500 mt-1 leading-snug">
+              {formatDuration(stats.totalDur)} of source content,{" "}
+              {formatDuration(stats.canonicalDur)} after removing duplicates
+              {stats.duplicate > 0 ? (
+                <>
+                  {" "}— saves{" "}
+                  <span className="font-semibold text-emerald-700">
+                    {formatDuration(stats.totalDur - stats.canonicalDur)}
+                  </span>{" "}
+                  of redundant render time
+                </>
+              ) : null}
+            </p>
+          </div>
+          {stillLoading && (
+            <span className="inline-flex items-center gap-1.5 text-[11.5px] font-medium text-slate-500 self-center">
+              <Loader2
+                size={11}
+                strokeWidth={2.4}
+                className="animate-spin-slow"
+              />
+              still segmenting some videos
+            </span>
+          )}
         </div>
-        {stillLoading && (
-          <span className="inline-flex items-center gap-1.5 text-[11.5px] font-medium text-slate-500">
-            <Loader2 size={11} strokeWidth={2.4} className="animate-spin-slow" />
-            still loading some videos
-          </span>
-        )}
+
+        {/* Stat pills */}
+        <div className="flex items-center gap-2 mt-4 flex-wrap">
+          <StatPill
+            icon={<Layers size={11} strokeWidth={2.4} />}
+            label="Total chunks"
+            value={stats.total}
+            tone="slate"
+          />
+          <StatPill
+            icon={<Sparkles size={11} strokeWidth={2.4} />}
+            label="Canonical"
+            value={stats.canonical}
+            tone="emerald"
+          />
+          <StatPill
+            icon={<Copy size={11} strokeWidth={2.4} />}
+            label="Duplicates"
+            value={stats.duplicate}
+            tone="amber"
+          />
+          <StatPill
+            icon={<FileVideo size={11} strokeWidth={2.4} />}
+            label="Videos"
+            value={children.length}
+            tone="indigo"
+          />
+        </div>
       </div>
 
-      {/* Flat deduped list */}
-      <div className="rounded-xl border border-slate-200 bg-white shadow-[0_1px_2px_rgba(9,9,11,0.04)] divide-y divide-slate-100 max-h-[600px] overflow-y-auto">
-        {unique.map((c, i) => (
-          <ChunkRowWithSource
-            key={`${c.jobId}::${c.id}`}
-            chunk={c}
-            sourceName={c.sourceName}
-            displayIndex={i}
+      {/* ── Filter + search bar ─────────────────────────────────── */}
+      <div className="flex items-center gap-2 flex-wrap">
+        <div className="inline-flex items-center rounded-lg border border-slate-200 bg-white p-0.5 shadow-[0_1px_2px_rgba(9,9,11,0.03)]">
+          <FilterChip
+            active={filter === "all"}
+            onClick={() => setFilter("all")}
+            count={stats.total}
+          >
+            All
+          </FilterChip>
+          <FilterChip
+            active={filter === "unique"}
+            onClick={() => setFilter("unique")}
+            count={stats.canonical}
+          >
+            <Sparkles
+              size={10}
+              strokeWidth={2.4}
+              className="inline mr-1 -mt-0.5"
+            />
+            Unique
+          </FilterChip>
+          <FilterChip
+            active={filter === "duplicates"}
+            onClick={() => setFilter("duplicates")}
+            count={stats.duplicate}
+            disabled={stats.duplicate === 0}
+          >
+            <Copy
+              size={10}
+              strokeWidth={2.4}
+              className="inline mr-1 -mt-0.5"
+            />
+            Duplicates
+          </FilterChip>
+        </div>
+
+        <label className="inline-flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-1.5 shadow-[0_1px_2px_rgba(9,9,11,0.03)] flex-1 max-w-[280px]">
+          <Search size={12} strokeWidth={2.2} className="text-slate-400 shrink-0" />
+          <input
+            type="search"
+            placeholder="Search topic or preview…"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            className="flex-1 min-w-0 text-[13px] text-slate-800 bg-transparent focus:outline-none placeholder:text-slate-400"
+          />
+        </label>
+
+        <div className="ml-auto inline-flex items-center gap-1">
+          <button
+            type="button"
+            onClick={expandAll}
+            className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-[11.5px] font-medium text-slate-600 hover:text-slate-900 hover:bg-slate-100 transition-colors"
+          >
+            <Eye size={11} strokeWidth={2.4} /> Expand all
+          </button>
+          <button
+            type="button"
+            onClick={collapseAll}
+            className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-[11.5px] font-medium text-slate-600 hover:text-slate-900 hover:bg-slate-100 transition-colors"
+          >
+            <EyeOff size={11} strokeWidth={2.4} /> Collapse all
+          </button>
+        </div>
+      </div>
+
+      {/* ── Per-video sections ──────────────────────────────────── */}
+      <div className="flex flex-col gap-3">
+        {children.map((child, idx) => (
+          <VideoChunkSection
+            key={child.id}
+            child={child}
+            videoIdx={idx}
+            chunks={byChild[child.id]}
+            collapsed={collapsedVideos.has(child.id)}
+            onToggle={() => toggleVideo(child.id)}
+            filter={filter}
+            search={searchLower}
           />
         ))}
       </div>
@@ -638,39 +773,315 @@ function UnifiedChunksView({
   );
 }
 
-function ChunkRowWithSource({
-  chunk,
-  sourceName,
-  displayIndex,
+// ── Sub-components ──────────────────────────────────────────────────────
+
+const TONE_STYLES = {
+  slate: "bg-slate-100 text-slate-700 border-slate-200",
+  emerald:
+    "bg-emerald-50 text-emerald-700 border-emerald-200/80",
+  amber: "bg-amber-50 text-amber-700 border-amber-200/80",
+  indigo: "bg-indigo-50 text-indigo-700 border-indigo-200/80",
+} as const;
+
+function StatPill({
+  icon,
+  label,
+  value,
+  tone,
 }: {
-  chunk: ChunkWithSource;
-  sourceName: string;
-  displayIndex: number;
+  icon: React.ReactNode;
+  label: string;
+  value: number;
+  tone: keyof typeof TONE_STYLES;
+}) {
+  return (
+    <span
+      className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md border text-[12px] font-medium ${TONE_STYLES[tone]}`}
+    >
+      {icon}
+      <span className="font-semibold nums tabular-nums">{value}</span>
+      <span className="opacity-70">{label}</span>
+    </span>
+  );
+}
+
+function FilterChip({
+  active,
+  onClick,
+  count,
+  disabled,
+  children,
+}: {
+  active: boolean;
+  onClick: () => void;
+  count: number;
+  disabled?: boolean;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-[12.5px] font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
+        active
+          ? "bg-slate-900 text-white shadow-[0_1px_2px_rgba(9,9,11,0.15)]"
+          : "text-slate-600 hover:bg-slate-50"
+      }`}
+    >
+      {children}
+      <span
+        className={`text-[11px] tabular-nums nums px-1.5 py-0.5 rounded ${
+          active ? "bg-white/15 text-white" : "bg-slate-100 text-slate-500"
+        }`}
+      >
+        {count}
+      </span>
+    </button>
+  );
+}
+
+// Per-video color accent — derived from the video index so each video
+// is visually distinct in the stack. Used for the stripe + index badge.
+const VIDEO_ACCENTS = [
+  { stripe: "from-indigo-500 to-blue-500", soft: "from-indigo-50 to-blue-50/60", text: "text-indigo-700", border: "border-indigo-200" },
+  { stripe: "from-fuchsia-500 to-pink-500", soft: "from-fuchsia-50 to-pink-50/60", text: "text-fuchsia-700", border: "border-fuchsia-200" },
+  { stripe: "from-emerald-500 to-teal-500", soft: "from-emerald-50 to-teal-50/60", text: "text-emerald-700", border: "border-emerald-200" },
+  { stripe: "from-amber-500 to-orange-500", soft: "from-amber-50 to-orange-50/60", text: "text-amber-700", border: "border-amber-200" },
+  { stripe: "from-rose-500 to-red-500", soft: "from-rose-50 to-red-50/60", text: "text-rose-700", border: "border-rose-200" },
+  { stripe: "from-sky-500 to-cyan-500", soft: "from-sky-50 to-cyan-50/60", text: "text-sky-700", border: "border-sky-200" },
+  { stripe: "from-violet-500 to-purple-500", soft: "from-violet-50 to-purple-50/60", text: "text-violet-700", border: "border-violet-200" },
+  { stripe: "from-lime-500 to-green-500", soft: "from-lime-50 to-green-50/60", text: "text-lime-700", border: "border-lime-200" },
+] as const;
+
+function VideoChunkSection({
+  child,
+  videoIdx,
+  chunks,
+  collapsed,
+  onToggle,
+  filter,
+  search,
+}: {
+  child: ChildRow;
+  videoIdx: number;
+  chunks: ChildChunkData | undefined;
+  collapsed: boolean;
+  onToggle: () => void;
+  filter: FilterMode;
+  search: string;
+}) {
+  const accent = VIDEO_ACCENTS[videoIdx % VIDEO_ACCENTS.length];
+
+  // Filtered chunk list with dedup-aware filtering and search.
+  const filtered = useMemo(() => {
+    if (!Array.isArray(chunks)) return [] as ChunkRow[];
+    return chunks.filter((c) => {
+      if (filter === "unique" && c.duplicateOfChunkId) return false;
+      if (filter === "duplicates" && !c.duplicateOfChunkId) return false;
+      if (search) {
+        const hay = `${c.topic} ${c.preview}`.toLowerCase();
+        if (!hay.includes(search)) return false;
+      }
+      return true;
+    });
+  }, [chunks, filter, search]);
+
+  const allChunks = Array.isArray(chunks) ? chunks : [];
+  const dupCount = allChunks.filter((c) => c.duplicateOfChunkId).length;
+  const canonicalCount = allChunks.length - dupCount;
+  const totalDur = allChunks.reduce((s, c) => s + (c.endSec - c.startSec), 0);
+
+  // Status text for header.
+  let statusNode: React.ReactNode;
+  if (chunks === "loading" || chunks === undefined) {
+    statusNode = (
+      <span className="inline-flex items-center gap-1 text-[11.5px] text-slate-500">
+        <Loader2 size={10} strokeWidth={2.4} className="animate-spin-slow" />
+        loading
+      </span>
+    );
+  } else if (chunks === "none") {
+    statusNode = (
+      <span className="text-[11.5px] text-slate-400 italic">
+        not segmented yet
+      </span>
+    );
+  } else {
+    statusNode = (
+      <div className="flex items-center gap-1.5 flex-wrap justify-end">
+        <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[11px] font-medium bg-emerald-50 text-emerald-700 border border-emerald-200/80">
+          <Sparkles size={9} strokeWidth={2.4} />
+          {canonicalCount}
+        </span>
+        {dupCount > 0 && (
+          <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[11px] font-medium bg-amber-50 text-amber-700 border border-amber-200/80">
+            <Copy size={9} strokeWidth={2.4} />
+            {dupCount}
+          </span>
+        )}
+        <span className="text-[11.5px] text-slate-500 nums tabular-nums">
+          {formatDuration(totalDur)}
+        </span>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className={`rounded-xl border bg-white overflow-hidden shadow-[0_1px_2px_rgba(9,9,11,0.03)] transition-all ${accent.border}`}
+    >
+      {/* Header — clickable to expand/collapse */}
+      <button
+        type="button"
+        onClick={onToggle}
+        className={`w-full flex items-center gap-3 px-4 py-3 text-left transition-colors hover:bg-gradient-to-r hover:${accent.soft}`}
+      >
+        {/* Index badge with accent gradient */}
+        <span
+          className={`flex items-center justify-center w-9 h-9 rounded-xl bg-gradient-to-br ${accent.stripe} text-white text-[13px] font-semibold shrink-0 nums shadow-[inset_0_1px_0_rgba(255,255,255,0.2),_0_2px_6px_-1px_rgba(15,23,42,0.25)]`}
+        >
+          {String(videoIdx + 1).padStart(2, "0")}
+        </span>
+
+        <div className="flex-1 min-w-0">
+          <p className="text-[14.5px] font-semibold text-slate-900 truncate leading-snug">
+            {child.sourceName}
+          </p>
+          <p className="text-[12px] text-slate-500 mt-0.5 leading-tight">
+            {child.sourceDurationSec
+              ? formatDuration(child.sourceDurationSec)
+              : ""}
+            {Array.isArray(chunks) ? (
+              <>
+                {child.sourceDurationSec ? " · " : ""}
+                {chunks.length} chunk{chunks.length === 1 ? "" : "s"}
+              </>
+            ) : null}
+          </p>
+        </div>
+
+        <div className="shrink-0">{statusNode}</div>
+
+        <motion.span
+          animate={{ rotate: collapsed ? 0 : 180 }}
+          transition={{ duration: 0.2 }}
+          className="text-slate-400 shrink-0 ml-1"
+        >
+          <ChevronDown size={16} strokeWidth={2.2} />
+        </motion.span>
+      </button>
+
+      <AnimatePresence initial={false}>
+        {!collapsed && Array.isArray(chunks) && (
+          <motion.div
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: "auto", opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={{ duration: 0.25, ease: [0.22, 1, 0.36, 1] }}
+            className="overflow-hidden"
+          >
+            <div className="border-t border-slate-100">
+              {filtered.length === 0 ? (
+                <div className="px-4 py-6 text-center">
+                  <p className="text-[12.5px] text-slate-400 italic">
+                    {search
+                      ? "No chunks match your search."
+                      : filter === "unique"
+                      ? "No unique chunks (every chunk in this video is a duplicate of an earlier one)."
+                      : filter === "duplicates"
+                      ? "No duplicate chunks in this video."
+                      : "No chunks."}
+                  </p>
+                </div>
+              ) : (
+                <div className="divide-y divide-slate-100">
+                  {filtered.map((c) => (
+                    <DedupAwareChunkRow
+                      key={c.id}
+                      chunk={c}
+                      jobId={child.id}
+                      accent={accent}
+                    />
+                  ))}
+                </div>
+              )}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}
+
+function DedupAwareChunkRow({
+  chunk,
+  jobId,
+  accent,
+}: {
+  chunk: ChunkRow;
+  jobId: string;
+  accent: (typeof VIDEO_ACCENTS)[number];
 }) {
   const [open, setOpen] = useState(false);
   const [current, setCurrent] = useState<ChunkRow>(chunk);
-  // Keep `current` in sync if the upstream chunk prop updates (e.g.
-  // poll arrived with new data for the underlying row).
   useEffect(() => {
     setCurrent(chunk);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [chunk.id, chunk.topic, chunk.text]);
+  }, [chunk.id, chunk.topic, chunk.text, chunk.duplicateOfChunkId]);
+
+  const isDup = !!current.duplicateOfChunkId;
+  const dupTopic = current.duplicateOf?.topic;
+  const dupSource = current.duplicateOf?.sourceName;
 
   return (
-    <div className="px-1">
-      {/* Source-video tag — small grey label above the chunk header */}
-      {open && (
-        <p className="px-3 pt-2 text-[10.5px] uppercase tracking-wide font-semibold text-slate-400">
-          From: <span className="text-slate-600 normal-case font-medium">{sourceName}</span>
-        </p>
+    <div
+      className={`relative ${
+        isDup ? "bg-amber-50/30" : "bg-white"
+      } transition-colors`}
+    >
+      {/* Left accent stripe — only for canonical rows, so duplicates
+          read as visually different. */}
+      {!isDup && (
+        <span
+          className={`absolute left-0 top-0 bottom-0 w-0.5 bg-gradient-to-b ${accent.stripe} opacity-40`}
+        />
       )}
-      <ChunkRowEditable
-        jobId={chunk.jobId}
-        chunk={{ ...current, idx: displayIndex }}
-        isOpen={open}
-        onToggle={() => setOpen((c) => !c)}
-        onSaved={(updated) => setCurrent((prev) => ({ ...prev, ...updated }))}
-      />
+
+      <div className="px-3 py-2 pl-4">
+        {isDup && (
+          <div className="mb-1.5 inline-flex items-start gap-1.5 text-[11.5px] text-amber-700 bg-amber-100/70 border border-amber-200 rounded-md px-2 py-1 max-w-full">
+            <Copy
+              size={11}
+              strokeWidth={2.3}
+              className="shrink-0 mt-[1px]"
+            />
+            <span className="leading-tight">
+              <span className="font-semibold">Duplicate</span> of &ldquo;
+              {dupTopic ?? "another chunk"}&rdquo;
+              {dupSource ? (
+                <>
+                  {" "}from <span className="font-medium">{dupSource}</span>
+                </>
+              ) : null}
+              {current.duplicateReason ? (
+                <span className="block text-amber-800/70 italic mt-0.5 text-[11px]">
+                  {current.duplicateReason}
+                </span>
+              ) : null}
+            </span>
+          </div>
+        )}
+        <ChunkRowEditable
+          jobId={jobId}
+          chunk={current}
+          isOpen={open}
+          onToggle={() => setOpen((c) => !c)}
+          onSaved={(updated) =>
+            setCurrent((prev) => ({ ...prev, ...updated }))
+          }
+        />
+      </div>
     </div>
   );
 }

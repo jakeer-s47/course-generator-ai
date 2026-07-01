@@ -61,3 +61,6 @@ Thumbs.db
 # ─── Coverage / tsbuild ──────────────────────────────────────────────
 coverage/
 *.tsbuildinfo
+
+# ─── Local docs (kept out of the repo) ───────────────────────────────
+/docs/

@@ -33,13 +33,7 @@ export async function GET(
     ? (levelParam as CleanLevel)
     : null;
   const targetMin = Number(targetParam);
-
-  if (!cleanLevel || !Number.isFinite(targetMin)) {
-    return NextResponse.json(
-      { error: "Missing or invalid level / targetMin" },
-      { status: 400 },
-    );
-  }
+  const hasExplicitRun = !!(cleanLevel && Number.isFinite(targetMin));
 
   const job = await prisma.job.findUnique({
     where: { id },
@@ -52,14 +46,30 @@ export async function GET(
     return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   }
 
+  // When level + targetMin are omitted, fall back to the latest ready
+  // segment_run for this job. Lets the Avatar step hydrate chunks on a
+  // direct-to-step-6 resume without knowing the user's prior split params
+  // (which only SplitStep tracks). The existing call from SplitStep keeps
+  // working unchanged since it always passes both params.
+  let fallbackRunId: string | null = null;
+  if (!hasExplicitRun) {
+    const latest = await prisma.segmentRun.findFirst({
+      where: { jobId: id, status: "ready" },
+      orderBy: { createdAt: "desc" },
+      select: { id: true },
+    });
+    fallbackRunId = latest?.id ?? null;
+  }
   const run = await prisma.segmentRun.findUnique({
-    where: {
-      jobId_cleanLevel_targetMin: {
-        jobId: id,
-        cleanLevel,
-        targetMin,
-      },
-    },
+    where: hasExplicitRun
+      ? {
+          jobId_cleanLevel_targetMin: {
+            jobId: id,
+            cleanLevel: cleanLevel!,
+            targetMin,
+          },
+        }
+      : { id: fallbackRunId ?? "__missing__" },
     include: {
       chunks: {
         orderBy: { idx: "asc" },
@@ -111,6 +121,20 @@ export async function GET(
           sourceName: c.duplicateOf.segmentRun.job.sourceName,
         }
       : null,
+    // Web enrichment (Pass 4 of segmentation). The UI uses these to
+    // toggle between Original / Enriched script tabs and show the
+    // sources panel. Step 6 reads enrichedText ?? text when sending
+    // to HeyGen.
+    enrichedText: c.enrichedText,
+    enrichmentSources: c.enrichmentSources,
+    enrichmentStatus: c.enrichmentStatus,
+    enrichmentError: c.enrichmentError,
+    // Hierarchy: "sun" | "planet" | "moon". Parent points at the
+    // containing sun (for planets) or planet (for moons). Suns +
+    // legacy flat chunks have parentChunkId = NULL. The frontend
+    // reconstructs the tree by grouping on parentChunkId.
+    level: c.level,
+    parentChunkId: c.parentChunkId,
   }));
 
   return NextResponse.json({

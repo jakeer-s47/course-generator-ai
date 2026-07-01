@@ -315,16 +315,17 @@ export async function probePlaylist(
 // Process-local semaphore — caps in-flight yt-dlp processes at
 // MAX_DOWNLOAD_CONCURRENCY. Extra callers wait their turn.
 //
-// Set to 1 (strictly serial) so playlist children are processed one-at-a-
-// time. The user gets a clean "Currently downloading: <title>" pattern
-// where exactly one row is active at a moment, the rest show "Waiting".
-// Trade-off: total wall-clock time is slower than concurrency=3, but the
-// UX is much clearer about what's happening.
+// Set to 2 so a playlist's children download in pairs — total
+// wall-clock for an N-video playlist is roughly N/2 × per-video time
+// (plus tail). The UI still shows one "Currently downloading" + at
+// most one peer; queued children sit at "Waiting". A higher value
+// risks YouTube's per-IP rate limiter on quick-fire playlists; if
+// you want maximum throughput on a stable network, bump to 3.
 //
 // When we move to the worker package this gets replaced by a real queue.
 // ---------------------------------------------------------------------------
 
-const MAX_DOWNLOAD_CONCURRENCY = 1;
+const MAX_DOWNLOAD_CONCURRENCY = 2;
 let inFlight = 0;
 const waiters: Array<() => void> = [];
 
@@ -417,9 +418,9 @@ async function runDownloadAudio(params: {
   const outTemplate = path.join(outDirAbs, "audio.%(ext)s");
   const finalAbs = path.join(outDirAbs, "audio.mp3");
 
-  // Args mirror the plan exactly. The progress template is custom so we
-  // can grep deterministically without dealing with yt-dlp's default ANSI
-  // status line.
+  // Args tuned for fast audio-only ingestion. The progress template is
+  // custom so we can grep deterministically without dealing with
+  // yt-dlp's default ANSI status line.
   const args = [
     "--no-warnings",
     "--no-playlist",
@@ -428,13 +429,35 @@ async function runDownloadAudio(params: {
     "--progress",             // re-enable progress (machine-templated below)
     "--progress-template",
     "download:%(progress._percent_str)s",
+    // BIGGEST DOWNLOAD-SPEED WIN: pull only the audio stream, never
+    // the full video. YouTube's `bestaudio` is typically a 50–100 MB
+    // m4a/webm vs 200–500 MB for the muxed mp4. Falls back to `best`
+    // for hosts that don't expose an audio-only track. After the
+    // post-processor below re-encodes to 16 kHz mono mp3 we end up
+    // ~10–20 MB final.
+    "--format",
+    "bestaudio/best",
+    // Fetch fragments in parallel. YouTube DASH streams are split
+    // into 5–10s chunks; default is sequential. 4 in flight gives
+    // a 2–4x speedup on the network side.
+    "--concurrent-fragments",
+    "4",
+    // Retry transient network failures instead of giving up on
+    // first 5xx / connection reset.
+    "--retries",
+    "3",
+    "--fragment-retries",
+    "3",
     "--extract-audio",
     "--audio-format",
     "mp3",
     "--audio-quality",
-    "128K",
+    "64K",
     "--postprocessor-args",
-    "ffmpeg:-ac 1 -ar 48000",
+    // 16 kHz mono — Whisper's native input rate. Matches what
+    // src/lib/ffmpeg.ts:extractAudio produces for file uploads, so URL
+    // and file ingestion produce identical audio.
+    "ffmpeg:-ac 1 -ar 16000",
     "--output",
     outTemplate,
     url,
@@ -500,9 +523,9 @@ async function runDownloadAudio(params: {
     absPath: finalAbs,
     sizeBytes: stat.size,
     durationSec,
-    sampleRateHz: 48000,
+    sampleRateHz: 16000,
     channels: 1,
     codec: "mp3",
-    bitrateKbps: 128,
+    bitrateKbps: 64,
   };
 }

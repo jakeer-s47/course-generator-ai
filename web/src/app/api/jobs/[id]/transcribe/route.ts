@@ -66,12 +66,40 @@ export async function POST(
   }
 
   // Idempotent: if a transcript is already running or done, just return it.
+  // STALE-CLAIM RECOVERY: a row stuck in `transcribing` for >30 min is
+  // almost certainly orphaned (runner crashed, Python service died,
+  // network drop). Whisper runs are CPU-bound and can legitimately
+  // take 20+ min on long lectures, so we err on the side of patience
+  // (30 min) before assuming stale. Recovered rows are flipped to
+  // `failed` and fall through to a fresh claim below.
+  const STALE_MINUTES = 30;
+  const transcript = job.transcript;
+  const isStuck =
+    transcript?.status === "transcribing" &&
+    !!transcript.startedAt &&
+    Date.now() - new Date(transcript.startedAt).getTime() >
+      STALE_MINUTES * 60_000;
   if (
-    job.transcript &&
-    (job.transcript.status === "transcribing" ||
-      job.transcript.status === "ready")
+    transcript &&
+    !isStuck &&
+    (transcript.status === "transcribing" || transcript.status === "ready")
   ) {
-    return NextResponse.json(job.transcript, { status: 200 });
+    return NextResponse.json(transcript, { status: 200 });
+  }
+  if (isStuck && transcript) {
+    console.warn(
+      `[transcribe] stale-claim recovery for job=${id} — row stuck in 'transcribing' for >${STALE_MINUTES} min, resetting`,
+    );
+    await prisma.transcript
+      .update({
+        where: { id: transcript.id },
+        data: {
+          status: "failed",
+          errorCode: "E_STALE_CLAIM",
+          errorMessage: `Recovered: runner stuck in 'transcribing' for >${STALE_MINUTES} min`,
+        },
+      })
+      .catch(() => {});
   }
 
   // The OPENAI_API_KEY guard only matters when we're using the OpenAI

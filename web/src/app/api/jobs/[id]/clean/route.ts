@@ -141,11 +141,39 @@ export async function POST(
   // Idempotency: a run already in flight for this level → return as-is.
   // (A second POST while the first is still streaming would just waste API
   // quota and confuse the UI's polling loop.)
-  if (existing?.status === "cleaning") {
+  //
+  // STALE-CLAIM RECOVERY: a row stuck in `cleaning` for >5 min is
+  // almost certainly orphaned — the runner crashed before the
+  // try/catch could flip status to `failed` (network drop, OOM,
+  // process killed, etc.). Without this recovery, the row blocks
+  // every subsequent Re-clean indefinitely. Treat it as failed and
+  // fall through to the re-run path below.
+  const STALE_MINUTES = 5;
+  const isStuck =
+    existing?.status === "cleaning" &&
+    !!existing.startedAt &&
+    Date.now() - new Date(existing.startedAt).getTime() >
+      STALE_MINUTES * 60_000;
+  if (existing?.status === "cleaning" && !isStuck) {
     return NextResponse.json(existing, { status: 200 });
   }
-  // For ready/failed rows, fall through and re-run. The UI's explicit
-  // "Re-clean" button is exactly this case.
+  if (isStuck) {
+    console.warn(
+      `[clean] stale-claim recovery for job=${id} level=${level} — row stuck in 'cleaning' for >${STALE_MINUTES} min, resetting`,
+    );
+    await prisma.cleanedTranscript
+      .update({
+        where: { id: existing!.id },
+        data: {
+          status: "failed",
+          errorCode: "E_STALE_CLAIM",
+          errorMessage: `Recovered: runner stuck in 'cleaning' for >${STALE_MINUTES} min`,
+        },
+      })
+      .catch(() => {});
+  }
+  // For ready/failed rows (and recovered-stale rows), fall through and
+  // re-run. The UI's explicit "Re-clean" button is exactly this case.
 
   if (!process.env.OPENAI_API_KEY) {
     return NextResponse.json(

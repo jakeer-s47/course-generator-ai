@@ -1350,12 +1350,11 @@ function FailurePanel({
         </div>
 
         <motion.button
-          whileHover={!isAuth ? { y: -1 } : undefined}
-          whileTap={!isAuth ? { scale: 0.97 } : undefined}
+          whileHover={{ y: -1 }}
+          whileTap={{ scale: 0.97 }}
           type="button"
           onClick={onRetry}
-          disabled={isAuth}
-          title={isAuth ? "Add OPENAI_API_KEY first" : "Retry cleanup (~$0.07)"}
+          title={isAuth ? "Retry after setting OPENAI_API_KEY and restarting" : "Retry cleanup (~$0.07)"}
           className="shrink-0 inline-flex items-center gap-1.5 px-4 py-2.5 rounded-lg text-[14px] font-medium text-white bg-gradient-to-br from-rose-600 via-rose-600 to-orange-500 shadow-[inset_0_1px_0_rgba(255,255,255,0.15),_0_4px_14px_-3px_rgba(244,63,94,0.5)] hover:shadow-[inset_0_1px_0_rgba(255,255,255,0.15),_0_8px_22px_-4px_rgba(244,63,94,0.65)] transition-shadow disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:shadow-[inset_0_1px_0_rgba(255,255,255,0.15),_0_4px_14px_-3px_rgba(244,63,94,0.5)]"
         >
           <RefreshCw size={13} strokeWidth={2.2} />

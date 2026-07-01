@@ -165,11 +165,25 @@ def _run_transcribe(audio_path: str, beam_size: int, vad_filter: bool) -> dict:
     is purely about keeping the event loop responsive.
     """
     model = _state["model"]
+    # Tightened VAD parameters when vad_filter is on. Recorded live
+    # classes have long Q&A pauses, screen-share waits, and reconnect
+    # gaps — sending those silent stretches to the model wastes CPU.
+    # min_silence_duration_ms=500 trims silences ≥0.5s (the default is
+    # 2000 ms which leaves a lot of dead air through). speech_pad_ms
+    # keeps a 100 ms cushion either side so word boundaries aren't
+    # clipped. Skipped when the caller explicitly disables VAD.
+    vad_kwargs: dict = {}
+    if vad_filter:
+        vad_kwargs["vad_parameters"] = {
+            "min_silence_duration_ms": 500,
+            "speech_pad_ms": 100,
+        }
     segments, info = model.transcribe(
         audio_path,
         word_timestamps=True,
         beam_size=beam_size,
         vad_filter=vad_filter,
+        **vad_kwargs,
     )
     words: list[dict] = []
     for seg in segments:

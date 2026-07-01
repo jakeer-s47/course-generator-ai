@@ -289,11 +289,26 @@ export async function transcribeAudio(params: {
 }): Promise<WhisperResult> {
   const { absPath, totalDurationSec, onChunkDone } = params;
 
-  const tempDir = await fs.mkdtemp(
-    path.join(os.tmpdir(), "chapter-ai-whisper-py-"),
-  );
+  // Cross-video cap. Process-All on a 12-video playlist used to fire
+  // 12 concurrent transcribeAudio() calls — each then ran up to 4
+  // parallel HTTP chunks against the same Python service. The service
+  // holds the GIL per inference, so those 48 calls serialised on the
+  // model anyway, with all the wasted async overhead, memory churn,
+  // and dropped progress reporting that implies. This semaphore caps
+  // simultaneous transcribeAudio invocations at 2 so playlists still
+  // see overlap between consecutive videos (one transcribing while
+  // the next preloads + chunks audio) without thrashing the model.
+  await acquireTranscribeSlot();
 
+  // tempDir is created INSIDE the try so that any failure (incl. the
+  // mkdtemp itself) still runs the finally → releaseTranscribeSlot().
+  // Acquiring the slot then throwing before the try would leak the
+  // slot forever and eventually wedge transcription process-wide.
+  let tempDir: string | null = null;
   try {
+    tempDir = await fs.mkdtemp(
+      path.join(os.tmpdir(), "chapter-ai-whisper-py-"),
+    );
     const chunks = await splitAudio(absPath, totalDurationSec, tempDir);
     const totalChunks = chunks.length;
     const parallel = Math.max(1, Math.min(resolveParallelism(), totalChunks));
@@ -344,6 +359,35 @@ export async function transcribeAudio(params: {
       durationSec: totalDurationSec,
     };
   } finally {
-    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    if (tempDir) {
+      await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    }
+    releaseTranscribeSlot();
   }
+}
+
+// ─── Cross-video transcription semaphore ───────────────────────────────────
+// Process-local. Caps concurrent transcribeAudio() invocations so a
+// playlist's children don't all hammer the GIL-bound Python service at
+// once. Same pattern as ffmpeg.ts / ytdlp.ts. Bump WHISPER_CROSS_CONCURRENCY
+// in .env.local if you run a dedicated GPU box and want more parallelism.
+
+const MAX_TRANSCRIBE_CONCURRENCY = Math.max(
+  1,
+  Math.min(8, Number(process.env.WHISPER_CROSS_CONCURRENCY) || 2),
+);
+let _txInFlight = 0;
+const _txWaiters: Array<() => void> = [];
+
+async function acquireTranscribeSlot(): Promise<void> {
+  while (_txInFlight >= MAX_TRANSCRIBE_CONCURRENCY) {
+    await new Promise<void>((resolve) => _txWaiters.push(resolve));
+  }
+  _txInFlight++;
+}
+
+function releaseTranscribeSlot(): void {
+  _txInFlight = Math.max(0, _txInFlight - 1);
+  const next = _txWaiters.shift();
+  if (next) next();
 }

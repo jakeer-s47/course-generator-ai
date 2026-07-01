@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { motion } from "motion/react";
 import {
@@ -27,10 +27,34 @@ import { ShareModal } from "@/components/ui/ShareModal";
 import { useToast } from "@/components/ui/Toast";
 
 export function CompletionScreen() {
-  const { chunks, renders, reset, selectedAvatarId } = useWizard();
+  const { chunks, renders, reset, selectedAvatarId, jobId } = useWizard();
   const [preview, setPreview] = useState<VideoPreviewData | null>(null);
   const [shareOpen, setShareOpen] = useState(false);
   const toast = useToast();
+
+  // chunkId → renderId for ready renders, so we can build real /file URLs
+  // for preview + download. Fetched once from the render endpoint.
+  const [renderIdByChunk, setRenderIdByChunk] = useState<
+    Record<string, string>
+  >({});
+  useEffect(() => {
+    if (!jobId) return;
+    let cancelled = false;
+    void fetch(`/api/jobs/${jobId}/render`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data: { renders?: { chunkId: string; id: string; status: string }[] } | null) => {
+        if (cancelled || !data?.renders) return;
+        const map: Record<string, string> = {};
+        for (const r of data.renders) {
+          if (r.status === "ready") map[r.chunkId] = r.id;
+        }
+        setRenderIdByChunk(map);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [jobId]);
 
   // Avatar hue mapping (parallels AvatarStep's AVATARS list)
   const avatarLookup: Record<string, { hue: number; name: string }> = {
@@ -72,6 +96,9 @@ export function CompletionScreen() {
   function openPreview(i: number) {
     const c = displayChunks[i];
     if (!c) return;
+    const rid = renderIdByChunk[c.id];
+    const videoUrl =
+      rid && jobId ? `/api/jobs/${jobId}/render/${rid}/file` : undefined;
     setPreview({
       index: i + 1,
       topic: c.topic,
@@ -79,20 +106,40 @@ export function CompletionScreen() {
       avatarHue: activeAvatar.hue,
       avatarName: activeAvatar.name,
       wordCount: c.wordCount,
+      videoUrl,
     });
   }
 
   function handleDownloadOne(i: number) {
     const c = displayChunks[i];
     if (!c) return;
-    toast.download("Download started", `${c.topic} · 1080p MP4`);
+    const rid = renderIdByChunk[c.id];
+    if (!rid || !jobId) {
+      toast.error("Not available", "This video hasn't been rendered yet");
+      return;
+    }
+    window.open(
+      `/api/jobs/${jobId}/render/${rid}/file?download=1`,
+      "_blank",
+      "noopener,noreferrer",
+    );
+    toast.download("Download started", `${c.topic} · MP4`);
   }
 
   function handleDownloadAll() {
-    toast.download(
-      `Downloading ${totalChunks} videos`,
-      "Zipped and on the way",
-    );
+    const ready = displayChunks.filter((c) => renderIdByChunk[c.id]);
+    if (ready.length === 0 || !jobId) {
+      toast.error("Nothing to download", "No rendered videos yet");
+      return;
+    }
+    for (const c of ready) {
+      window.open(
+        `/api/jobs/${jobId}/render/${renderIdByChunk[c.id]}/file?download=1`,
+        "_blank",
+        "noopener,noreferrer",
+      );
+    }
+    toast.download(`Downloading ${ready.length} videos`, "Tabs opening per chunk");
   }
 
   function handleReset() {

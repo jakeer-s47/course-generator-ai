@@ -118,18 +118,21 @@ export async function POST(
   };
 
   await prisma.$transaction(async (tx) => {
-    // 1. Bump followers' idx out of the way (unique constraint).
+    // 1. Bump sibling followers' idx by +1. Scoped to the same parent
+    //    under hierarchical model. (segmentRunId, idx) unique was
+    //    dropped when hierarchy was added — single pass works.
     const followers = await tx.chunk.findMany({
       where: {
         segmentRunId: target.segmentRunId,
+        parentChunkId: target.parentChunkId,
         idx: { gt: target.idx },
       },
-      orderBy: { idx: "asc" },
+      orderBy: { idx: "desc" }, // descending → no transient collisions
     });
     for (const c of followers) {
       await tx.chunk.update({
         where: { id: c.id },
-        data: { idx: c.idx + 100000 },
+        data: { idx: c.idx + 1 },
       });
     }
     // 2. Update target → first half.
@@ -137,22 +140,18 @@ export async function POST(
       where: { id: target.id },
       data: aData,
     });
-    // 3. Insert second half right after.
+    // 3. Insert second half right after, inheriting the same parent +
+    //    level so the new sibling lives at the same tree depth.
     await tx.chunk.create({
       data: {
         segmentRunId: target.segmentRunId,
         idx: target.idx + 1,
+        parentChunkId: target.parentChunkId,
+        level: target.level,
         ...bData,
       },
     });
-    // 4. Settle followers shifted by +1.
-    for (let i = 0; i < followers.length; i++) {
-      await tx.chunk.update({
-        where: { id: followers[i].id },
-        data: { idx: target.idx + 2 + i },
-      });
-    }
-    // 5. Bump SegmentRun's chunkCount.
+    // 4. Bump SegmentRun's chunkCount.
     await tx.segmentRun.update({
       where: { id: target.segmentRunId },
       data: { chunkCount: { increment: 1 } },

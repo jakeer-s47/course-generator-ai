@@ -22,6 +22,9 @@ export type VideoPreviewData = {
   avatarHue?: number;
   avatarName?: string;
   wordCount?: number;
+  /** Server-side URL for the rendered mp4 (Step 6). When set, the
+   *  modal renders a real <video> element instead of the SVG mock. */
+  videoUrl?: string;
 };
 
 export function VideoPreviewModal({
@@ -76,6 +79,35 @@ export function VideoPreviewModal({
       `${data!.topic} · 1080p MP4`,
     );
     onClose();
+  }
+
+  // When a real videoUrl is present (Step 6 render completed), render
+  // the actual mp4 instead of the SVG mock. Range-supporting backend
+  // route at /api/jobs/[id]/render/[renderId]/file lets <video> scrub.
+  if (data.videoUrl) {
+    return (
+      <Modal open={open} onClose={onClose} size="lg">
+        <div className="relative aspect-video w-full bg-black overflow-hidden">
+          {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
+          <video
+            src={data.videoUrl}
+            controls
+            autoPlay
+            className="w-full h-full"
+          />
+        </div>
+        <div className="px-6 py-4 border-t border-slate-200 bg-white">
+          <p className="text-[16px] font-semibold text-slate-900">
+            {data.topic}
+          </p>
+          <p className="text-[12.5px] text-slate-500 mt-0.5">
+            {data.index ? `Chunk ${data.index} · ` : ""}
+            {formatDuration(data.durationSec)}
+            {data.wordCount ? ` · ${data.wordCount.toLocaleString()} words` : ""}
+          </p>
+        </div>
+      </Modal>
+    );
   }
 
   return (

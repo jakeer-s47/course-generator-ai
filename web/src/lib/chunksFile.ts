@@ -14,7 +14,13 @@ import { absPathFor, chunksJsonKey } from "@/lib/storage";
 export async function rewriteChunksJson(runId: string): Promise<void> {
   const run = await prisma.segmentRun.findUnique({
     where: { id: runId },
-    include: { chunks: { orderBy: { idx: "asc" } } },
+    // Order by createdAt so a tree-traversal insertion order (suns →
+    // their planets → their moons) survives the round-trip. idx is now
+    // sibling-position within parent, so it alone is no longer enough
+    // to globally sort the rows.
+    include: {
+      chunks: { orderBy: [{ createdAt: "asc" }, { idx: "asc" }] },
+    },
   });
   if (!run) return;
 
@@ -28,14 +34,24 @@ export async function rewriteChunksJson(runId: string): Promise<void> {
         {
           cleanLevel: run.cleanLevel,
           targetMin: run.targetMin,
+          // Flat list of rows. `level` + `parentChunkId` let Step 6
+          // (HeyGen) rebuild the tree if it cares — typically it just
+          // filters to `level === "planet"` and renders one video per
+          // canonical planet (`duplicateOfChunkId === null`).
           chunks: run.chunks.map((c) => ({
+            id: c.id,
             idx: c.idx,
+            level: c.level,
+            parentChunkId: c.parentChunkId,
             topic: c.topic,
             preview: c.preview,
             startSec: c.startSec,
             endSec: c.endSec,
             wordCount: c.wordCount,
             text: c.text,
+            enrichedText: c.enrichedText,
+            enrichmentStatus: c.enrichmentStatus,
+            duplicateOfChunkId: c.duplicateOfChunkId,
           })),
         },
         null,

@@ -202,8 +202,16 @@ export async function transcribeAudio(params: {
 }): Promise<WhisperResult> {
   const { absPath, totalDurationSec, onChunkDone } = params;
 
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "chapter-ai-whisper-"));
+  // Cross-video cap (parity with the python provider). Process-All on a
+  // big playlist would otherwise fire one transcribeAudio per child,
+  // each opening WHISPER_CONCURRENCY parallel OpenAI calls — easily
+  // tripping the per-key Whisper rate limit (429s). This caps how many
+  // videos transcribe at once. tempDir is created inside the try so a
+  // mkdtemp failure still releases the slot.
+  await acquireTranscribeSlot();
+  let tempDir: string | null = null;
   try {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "chapter-ai-whisper-"));
     const chunks = await splitAudio(absPath, totalDurationSec, tempDir);
     const totalChunks = chunks.length;
 
@@ -316,6 +324,35 @@ export async function transcribeAudio(params: {
     };
   } finally {
     // Best-effort cleanup of split chunks
-    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    if (tempDir) {
+      await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    }
+    releaseTranscribeSlot();
   }
+}
+
+// ─── Cross-video transcription semaphore ───────────────────────────────────
+// Process-local. Caps concurrent transcribeAudio() invocations so a
+// playlist's children don't all hit OpenAI's Whisper rate limit at once.
+// Mirrors the python provider's semaphore. WHISPER_CROSS_CONCURRENCY
+// tunes it (default 2).
+
+const MAX_TRANSCRIBE_CONCURRENCY = Math.max(
+  1,
+  Math.min(8, Number(process.env.WHISPER_CROSS_CONCURRENCY) || 2),
+);
+let _txInFlight = 0;
+const _txWaiters: Array<() => void> = [];
+
+async function acquireTranscribeSlot(): Promise<void> {
+  while (_txInFlight >= MAX_TRANSCRIBE_CONCURRENCY) {
+    await new Promise<void>((resolve) => _txWaiters.push(resolve));
+  }
+  _txInFlight++;
+}
+
+function releaseTranscribeSlot(): void {
+  _txInFlight = Math.max(0, _txInFlight - 1);
+  const next = _txWaiters.shift();
+  if (next) next();
 }

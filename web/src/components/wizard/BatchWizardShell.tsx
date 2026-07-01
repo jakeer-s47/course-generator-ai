@@ -539,8 +539,13 @@ function UnifiedChunksView({
     };
   }, [children, cleanLevel, targetMin]);
 
-  // Aggregate stats across all children. Duplicate detection comes
-  // from the server-side dedup pass (duplicateOfChunkId is non-null).
+  // Aggregate stats across all children. Hierarchical chunks are
+  // collapsed to the PLANET level — the render unit for Step 6 — so
+  // moons (sub-sections) aren't double-counted and suns (navigation
+  // labels with no own text) don't inflate the runtime stat. Legacy
+  // flat chunks default to level="planet", so they pass through
+  // naturally. Duplicate detection from server-side dedup
+  // (duplicateOfChunkId non-null) is unchanged.
   const stats = useMemo(() => {
     let total = 0;
     let canonical = 0;
@@ -551,6 +556,8 @@ function UnifiedChunksView({
       const list = byChild[child.id];
       if (!Array.isArray(list)) continue;
       for (const c of list) {
+        const isPlanet = (c.level ?? "planet") === "planet";
+        if (!isPlanet) continue;
         total += 1;
         const dur = Math.max(0, c.endSec - c.startSec);
         totalDur += dur;
@@ -874,9 +881,14 @@ function VideoChunkSection({
   const accent = VIDEO_ACCENTS[videoIdx % VIDEO_ACCENTS.length];
 
   // Filtered chunk list with dedup-aware filtering and search.
+  // Multi-video aggregate view is planet-only — moons are sub-sections
+  // (rendered inside their parent planet's script) and suns are
+  // navigation labels (no own text). Showing them here would clutter
+  // the cross-video comparison.
   const filtered = useMemo(() => {
     if (!Array.isArray(chunks)) return [] as ChunkRow[];
     return chunks.filter((c) => {
+      if ((c.level ?? "planet") !== "planet") return false;
       if (filter === "unique" && c.duplicateOfChunkId) return false;
       if (filter === "duplicates" && !c.duplicateOfChunkId) return false;
       if (search) {
@@ -887,10 +899,16 @@ function VideoChunkSection({
     });
   }, [chunks, filter, search]);
 
-  const allChunks = Array.isArray(chunks) ? chunks : [];
-  const dupCount = allChunks.filter((c) => c.duplicateOfChunkId).length;
-  const canonicalCount = allChunks.length - dupCount;
-  const totalDur = allChunks.reduce((s, c) => s + (c.endSec - c.startSec), 0);
+  // Stats also count planet-level rows only.
+  const allPlanets = Array.isArray(chunks)
+    ? chunks.filter((c) => (c.level ?? "planet") === "planet")
+    : [];
+  const dupCount = allPlanets.filter((c) => c.duplicateOfChunkId).length;
+  const canonicalCount = allPlanets.length - dupCount;
+  const totalDur = allPlanets.reduce(
+    (s, c) => s + (c.endSec - c.startSec),
+    0,
+  );
 
   // Status text for header.
   let statusNode: React.ReactNode;

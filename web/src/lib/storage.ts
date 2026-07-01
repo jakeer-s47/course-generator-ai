@@ -1,4 +1,7 @@
 import fs from "node:fs/promises";
+import { createWriteStream } from "node:fs";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import path from "node:path";
 
 const STORAGE_DIR = process.env.STORAGE_DIR ?? "./uploads";
@@ -54,6 +57,26 @@ export function chunksJsonKey(
   return path.join(jobId, "chunks", level, `${targetMin}min`, "chunks.json");
 }
 
+/**
+ * Build the key (relative path) for the instructor photo uploaded at
+ * Step 6 when renderStyle = "instructor". The talking-head avatar is
+ * trained from this image. Optional per job — only present when the
+ * user picks the "instructor" render style.
+ */
+export function instructorPhotoKey(jobId: string, extension: string): string {
+  const ext = extension.replace(/^\./, "").toLowerCase() || "jpg";
+  return path.join(jobId, "render", `instructor.${ext}`);
+}
+
+/**
+ * Build the key (relative path) for a chunk's rendered avatar video at
+ * Step 6. One mp4 per chunk per job. Always at the same path so
+ * re-renders overwrite the previous file cleanly.
+ */
+export function renderOutputKey(jobId: string, chunkId: string): string {
+  return path.join(jobId, "renders", chunkId, "output.mp4");
+}
+
 /** Absolute path for a given storage key. */
 export function absPathFor(key: string): string {
   return path.resolve(root(), key);
@@ -62,6 +85,11 @@ export function absPathFor(key: string): string {
 /**
  * Persist a browser-uploaded File (via request.formData()) to disk.
  * Returns info about where it landed.
+ *
+ * STREAMING WRITE: the file body is piped through `Readable.from(File.stream())`
+ * directly to a `createWriteStream` sink. We never load the full file
+ * into a single Buffer — a 4 GB lecture upload no longer spikes Node's
+ * heap by 4 GB; backpressure is handled by the stream pipeline.
  */
 export async function saveFileToDisk(
   jobId: string,
@@ -75,11 +103,19 @@ export async function saveFileToDisk(
 
   await fs.mkdir(path.dirname(absPath), { recursive: true });
 
-  const arrayBuffer = await file.arrayBuffer();
-  const buffer = Buffer.from(arrayBuffer);
-  await fs.writeFile(absPath, buffer);
+  // file.stream() returns a Web ReadableStream<Uint8Array>; Readable.from
+  // wraps it as a Node Readable that pipeline can plumb into the
+  // filesystem write stream. pipeline() handles errors + cleanup
+  // properly — if the write fails halfway, the partial file is removed
+  // by the OS-level fd close, and the rejection bubbles up.
+  await pipeline(
+    Readable.fromWeb(file.stream() as Parameters<typeof Readable.fromWeb>[0]),
+    createWriteStream(absPath),
+  );
 
-  return { key, absPath, size: buffer.byteLength };
+  // Use file.size (browser-reported) instead of a stat() round-trip;
+  // the File spec guarantees this is the exact byte length we just wrote.
+  return { key, absPath, size: file.size };
 }
 
 /** Delete all files for a job (used on retry/rollback). */

@@ -43,12 +43,15 @@ export async function POST(
     );
   }
 
-  const prev = await prisma.chunk.findUnique({
+  // Sibling lookup: same parent (or NULL parent for top-level rows) +
+  // same segmentRun, idx one less than target. The old composite unique
+  // `segmentRunId_idx` was dropped when hierarchy was introduced —
+  // multiple rows can share idx if they have different parents.
+  const prev = await prisma.chunk.findFirst({
     where: {
-      segmentRunId_idx: {
-        segmentRunId: target.segmentRunId,
-        idx: target.idx - 1,
-      },
+      segmentRunId: target.segmentRunId,
+      parentChunkId: target.parentChunkId,
+      idx: target.idx - 1,
     },
   });
   if (!prev) {
@@ -74,27 +77,24 @@ export async function POST(
     });
     // 2. Delete the merged chunk.
     await tx.chunk.delete({ where: { id: target.id } });
-    // 3. Renumber subsequent chunks. Two-pass to avoid unique-constraint
-    //    collisions (idx is unique within a run).
+    // 3. Renumber subsequent siblings. Idx is sibling-position within
+    //    parent under the hierarchical model — scope to the same
+    //    segmentRun + parentChunkId. The old two-pass bump (idx + 100k)
+    //    was needed when (segmentRunId, idx) had a unique constraint;
+    //    that constraint was dropped when hierarchy was added, so a
+    //    single decrement pass is now correct.
     const followers = await tx.chunk.findMany({
       where: {
         segmentRunId: target.segmentRunId,
+        parentChunkId: target.parentChunkId,
         idx: { gt: target.idx },
       },
       orderBy: { idx: "asc" },
     });
-    // Pass 1 — bump way out of the way.
     for (const c of followers) {
       await tx.chunk.update({
         where: { id: c.id },
-        data: { idx: c.idx + 100000 },
-      });
-    }
-    // Pass 2 — settle to consecutive starting at target.idx.
-    for (let i = 0; i < followers.length; i++) {
-      await tx.chunk.update({
-        where: { id: followers[i].id },
-        data: { idx: target.idx + i },
+        data: { idx: c.idx - 1 },
       });
     }
     // 4. Update SegmentRun stats.

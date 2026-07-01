@@ -13,7 +13,7 @@ export const dynamic = "force-dynamic";
 const MAX_SIZE_BYTES = 10 * 1024 * 1024 * 1024; // 10 GB — Phase 1 dev cap
 const MAX_URL_LENGTH = 2000;
 const MAX_BATCH_FILES = 25;
-const ACCEPTED_TYPES = [
+const ACCEPTED_TYPES = new Set([
   "video/mp4",
   "video/quicktime",
   "video/x-matroska",
@@ -22,8 +22,35 @@ const ACCEPTED_TYPES = [
   "audio/wav",
   "audio/x-wav",
   "audio/mp4",
+  "audio/x-m4a",
+  "audio/webm",
   "audio/ogg",
-];
+  "audio/flac",
+]);
+// Fallback when the browser reports application/octet-stream (common for
+// .mkv on Safari, .m4a on some Firefox builds, etc.). We accept any of
+// these extensions even when the MIME is missing or generic.
+const ACCEPTED_EXTENSIONS = new Set([
+  ".mp4",
+  ".mov",
+  ".mkv",
+  ".webm",
+  ".mp3",
+  ".wav",
+  ".m4a",
+  ".ogg",
+  ".flac",
+  ".aac",
+]);
+
+function isAcceptedFile(f: File): boolean {
+  if (f.type && ACCEPTED_TYPES.has(f.type.toLowerCase())) return true;
+  // Extract extension by hand — the File object doesn't expose one.
+  const dot = f.name.lastIndexOf(".");
+  if (dot < 0) return false;
+  const ext = f.name.slice(dot).toLowerCase();
+  return ACCEPTED_EXTENSIONS.has(ext);
+}
 
 /**
  * POST /api/jobs
@@ -91,6 +118,20 @@ async function handleFilePost(request: Request) {
         { status: 413 },
       );
     }
+    // Reject anything that's clearly not an audio / video file. Saves
+    // disk space + Step 2 ffmpeg cycles on a random binary the user
+    // dropped by mistake.
+    if (!isAcceptedFile(f)) {
+      return NextResponse.json(
+        {
+          error: `File "${f.name}" isn't a supported audio or video format. Use mp4, mov, mkv, webm, mp3, wav, m4a, ogg, flac, or aac.`,
+          code: "E_UNSUPPORTED_FORMAT",
+          filename: f.name,
+          contentType: f.type || "(none)",
+        },
+        { status: 415 },
+      );
+    }
   }
 
   // Per-file duration hints (optional). Client appends `durationSec` once
@@ -123,7 +164,7 @@ async function handleSingleFilePost(
 ) {
   const type = file.type || "application/octet-stream";
   const acceptedGuess =
-    ACCEPTED_TYPES.includes(type) ||
+    ACCEPTED_TYPES.has(type) ||
     type.startsWith("video/") ||
     type.startsWith("audio/");
 
@@ -200,15 +241,38 @@ async function handleMultiFilePost(
   // Save every file to disk BEFORE the DB transaction. If any write fails,
   // bail out and clean up partial state — easier to reason about than
   // inside-transaction filesystem work.
-  const savedFiles: { key: string; size: number; mime: string }[] = [];
+  //
+  // Files are saved in PARALLEL batches of BATCH_WRITE_CONCURRENCY. A
+  // 10-file batch with 500 MB each used to take 10 × per-file time
+  // sequentially; now it runs 3-wide so the wall-clock is roughly
+  // ceil(N/3) × per-file time. The streaming write in saveFileToDisk
+  // means concurrent saves don't multiply the heap footprint.
+  const savedFiles: { key: string; size: number; mime: string }[] = new Array(
+    files.length,
+  );
+  const BATCH_WRITE_CONCURRENCY = 3;
   try {
-    for (let i = 0; i < files.length; i++) {
-      const result = await saveFileToDisk(childIds[i], files[i]);
-      savedFiles.push({
-        key: result.key,
-        size: result.size,
-        mime: files[i].type || "application/octet-stream",
-      });
+    for (
+      let start = 0;
+      start < files.length;
+      start += BATCH_WRITE_CONCURRENCY
+    ) {
+      const slice = files.slice(start, start + BATCH_WRITE_CONCURRENCY);
+      const results = await Promise.all(
+        slice.map(async (file, j) => {
+          const i = start + j;
+          const result = await saveFileToDisk(childIds[i], file);
+          return {
+            idx: i,
+            key: result.key,
+            size: result.size,
+            mime: file.type || "application/octet-stream",
+          };
+        }),
+      );
+      for (const r of results) {
+        savedFiles[r.idx] = { key: r.key, size: r.size, mime: r.mime };
+      }
     }
   } catch (err) {
     console.error("[POST /api/jobs batch] save to disk failed:", err);

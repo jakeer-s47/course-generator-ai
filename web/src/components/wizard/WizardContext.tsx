@@ -33,6 +33,10 @@ export type TopicChunk = {
   endSec: number;
   wordCount: number;
   preview: string;
+  // Character count of the narration script HeyGen will see (enrichedText
+  // when present, otherwise the cleaned text). Drives the per-chunk char
+  // chip in Step 6 and the parts-count estimate (chars / cap rounded up).
+  narrationChars?: number;
 };
 
 export type AvatarOption = {
@@ -91,8 +95,28 @@ export type WizardState = {
   chunks: TopicChunk[];
 
   // Step 6
+  // Render style — three modes the user picks BEFORE generating:
+  //   "instructor"  — talking-head AI avatar built from an uploaded
+  //                   instructor photo. Requires instructorPhotoKey.
+  //   "animated"    — cartoon/illustrated explainer. No photo input.
+  //   "whiteboard"  — voiceover narrating an animated whiteboard /
+  //                   blackboard. No photo input.
+  renderStyle: "instructor" | "animated" | "whiteboard";
+  // Server-side storage key for the uploaded instructor photo when
+  // renderStyle === "instructor". Null otherwise. Populated by the
+  // upload route (POST /api/jobs/[id]/instructor-photo).
+  instructorPhotoKey: string | null;
+  // Client-side blob URL for instant preview after upload (revoked on
+  // unmount). Server-side path persists in instructorPhotoKey.
+  instructorPhotoPreviewUrl: string | null;
+
   selectedAvatarId: string;
-  selectedVoice: string;
+  // HeyGen voice_id chosen at Step 6 (null = use server default voice).
+  selectedVoiceId: string | null;
+  // UI-only filter for the voice picker dropdown.
+  voiceGenderFilter: "all" | "male" | "female";
+  // Voice playback speed (0.5..2.0). 1.0 = natural. Persisted on Job.
+  voiceSpeed: number;
   renders: Record<string, RenderState>;
 };
 
@@ -125,8 +149,13 @@ const initial: WizardState = {
   cleanedReady: false,
   targetMinutes: 20,
   chunks: [],
+  renderStyle: "instructor",
+  instructorPhotoKey: null,
+  instructorPhotoPreviewUrl: null,
   selectedAvatarId: "",
-  selectedVoice: "atlas-04",
+  selectedVoiceId: null,
+  voiceGenderFilter: "all",
+  voiceSpeed: 1.0,
   renders: {},
 };
 

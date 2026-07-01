@@ -48,6 +48,19 @@ type CleanedRow = {
   errorMessage: string | null;
 };
 
+export type EnrichmentSource = {
+  url: string;
+  title: string;
+  snippet: string;
+};
+
+export type EnrichmentStatus =
+  | "pending"
+  | "enriching"
+  | "ready"
+  | "skipped"
+  | "failed";
+
 export type ChunkRow = {
   id: string;
   idx: number;
@@ -68,6 +81,17 @@ export type ChunkRow = {
     jobId: string;
     sourceName: string;
   } | null;
+  // Web enrichment (Pass 4 of Step 5). enrichedText is the polished
+  // tutorial-ready script Step 6 sends to HeyGen. NULL when status is
+  // anything other than "ready" — fall back to chunk.text in that case.
+  enrichedText?: string | null;
+  enrichmentSources?: EnrichmentSource[] | null;
+  enrichmentStatus?: EnrichmentStatus;
+  enrichmentError?: string | null;
+  // Hierarchy: "sun" navigation grouping, "planet" render unit, "moon"
+  // sub-section. Legacy chunks default to "planet" with parent NULL.
+  level?: "sun" | "planet" | "moon";
+  parentChunkId?: string | null;
 };
 
 export type CleanLevel = "light" | "standard" | "aggressive";

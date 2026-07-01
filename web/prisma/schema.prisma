@@ -43,6 +43,35 @@ model Job {
   parent      Job?    @relation("JobChildren", fields: [parentJobId], references: [id], onDelete: Cascade)
   children    Job[]   @relation("JobChildren")
 
+  // ─── Step 6 render preferences ─────────────────────────────────
+  // Three render styles supported (see AvatarStep.tsx + planned
+  // HeyGen / Synthesia integration):
+  //   "instructor"  — talking-head avatar built from instructorPhotoKey
+  //   "animated"    — cartoon/illustrated explainer (not yet wired)
+  //   "whiteboard"  — voiceover narrating a whiteboard animation (not wired)
+  // Default null until the user explicitly picks a style at Step 6.
+  renderStyle        String? @map("render_style")
+  // Path to the uploaded instructor photo (renderStyle="instructor").
+  // Always lives at uploads/<jobId>/render/instructor.<ext> per
+  // src/lib/storage.ts:instructorPhotoKey(). Null otherwise.
+  instructorPhotoKey String? @map("instructor_photo_key")
+  // HeyGen "talking_photo_id" cached after first upload of the
+  // instructor photo. Reused across every chunk render for the same
+  // job so we don't re-upload the same image dozens of times.
+  // Cleared whenever instructorPhotoKey changes (handled in the
+  // upload route).
+  instructorPhotoHeygenId String? @map("instructor_photo_heygen_id")
+
+  // HeyGen voice selection for Step 6. The Step 6 picker writes here via
+  // /api/jobs/[id]/render-prefs. Null = use the env default voice
+  // (HEYGEN_DEFAULT_VOICE_ID, falls back to John Doe in the route).
+  voiceId    String?  @map("voice_id")
+  // Voice playback speed sent as `voice.speed` to HeyGen. 1.0 = natural,
+  // 1.15 ≈ slightly brisk, 1.5 = fast. HeyGen accepts 0.5..2.0.
+  voiceSpeed Float?   @map("voice_speed")
+
+  renders Render[]
+
   // Relations — pipeline state is one row in JobStatus (1:1).
   status          JobStatus?
   audio           Audio?
@@ -249,11 +278,161 @@ model Chunk {
   // duplicate badge. NULL when the chunk is canonical.
   duplicateReason    String? @map("duplicate_reason")
 
+  // Web enrichment (Pass 4 of Step 5). Tavily search + GPT-4o synthesis
+  // produces a polished, technically-deeper script that Step 6 (HeyGen)
+  // sends to the avatar. The original `text` is preserved as ground
+  // truth. Step 6 reads `enrichedText` when present, falls back to `text`.
+  enrichedText      String? @map("enriched_text")
+  // Provenance: array of { url, title, snippet } for the sources Tavily
+  // returned and GPT used. NULL when enrichedText is NULL.
+  enrichmentSources Json?   @map("enrichment_sources")
+  // Lifecycle for the enrichment pass. Values:
+  //   pending    — never attempted (legacy rows or freshly-inserted)
+  //   enriching  — call in flight (rare to see; Pass 4 batches are quick)
+  //   ready      — enrichedText populated, sources stored
+  //   skipped    — explicitly not enriched (duplicate chunk, or no
+  //                TAVILY_API_KEY configured, or sun/moon level row)
+  //   failed     — Tavily or GPT-4o call threw; enrichmentError holds why
+  enrichmentStatus  String  @default("pending") @map("enrichment_status")
+  enrichmentError   String? @map("enrichment_error")
+
+  // Hierarchy in the topic tree. Three levels:
+  //   "sun"    — top-level core concept (~targetMin minutes); navigation
+  //              only, NOT rendered as an avatar video at Step 6.
+  //   "planet" — render unit (~5-10 min); ONE avatar video per planet;
+  //              dedup + enrich operate at this level only.
+  //   "moon"   — optional sub-section inside a planet's script (~1-3 min);
+  //              shown as a chapter marker, not its own video.
+  // Existing rows from before this feature get level="planet" and
+  // parentChunkId=NULL → they appear in the tree UI as orphan planets
+  // under a synthetic "Ungrouped" sun, no migration required.
+  level         String  @default("planet") @map("level")
+  // Self-relation: a planet's parent is its sun, a moon's parent is its
+  // planet. Suns have parentChunkId = NULL. Cascade so re-segmentation
+  // (which deletes prior rows) cleanly removes the whole subtree.
+  parentChunkId String? @map("parent_chunk_id") @db.Uuid
+  parent        Chunk?  @relation("ChunkTree", fields: [parentChunkId], references: [id], onDelete: Cascade)
+  treeChildren  Chunk[] @relation("ChunkTree")
+
+  // 1:1 — at most one Step 6 render per chunk. NULL until the user
+  // clicks Generate at Step 6. Cascade-on-delete via the Render side.
+  render Render?
+
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz()
   updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz()
 
-  @@unique([segmentRunId, idx])
   @@index([segmentRunId])
+  @@index([segmentRunId, parentChunkId, idx])
   @@index([duplicateOfChunkId])
+  @@index([parentChunkId])
   @@map("chunks")
+}
+
+// One row per chunk-level render at Step 6. Today only `style="instructor"`
+// is wired (HeyGen Talking Photo). `animated` + `whiteboard` exist in the
+// UI but the route returns 501 for those styles until a provider is wired.
+//
+// Lifecycle (mirrors the sibling-row pattern used by every other stage):
+//   pending    — row inserted, runner not yet started
+//   uploading  — sending photo to HeyGen (instructor style only, first
+//                render of a job)
+//   rendering  — HeyGen has the video_id, we're polling /video_status.get
+//   ready      — video_url populated, outputKey points at downloaded mp4
+//   failed     — errorCode/errorMessage tells why
+model Render {
+  id      String @id @default(uuid()) @db.Uuid
+  jobId   String @map("job_id") @db.Uuid
+  job     Job    @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  chunkId String @unique @map("chunk_id") @db.Uuid
+  chunk   Chunk  @relation(fields: [chunkId], references: [id], onDelete: Cascade)
+
+  // Render style at the time of creation. Matches Job.renderStyle.
+  // Stored on Render (not just Job) so re-rendering with a different
+  // style doesn't retroactively change history.
+  style String
+
+  // HeyGen's video_id returned from /video/generate. NULL until the
+  // provider call succeeds.
+  providerJobId String? @map("provider_job_id")
+
+  status   String @default("pending")
+  progress Int    @default(0) // 0-100
+
+  // Multi-part render tracking. HeyGen's per-video input_text cap (3000
+  // chars for the default voice tier) means a long planetary script gets
+  // split into N HeyGen calls. `totalParts` is fixed at runner start;
+  // `currentPart` increments as each part finishes. UI displays
+  // "Part X of N" while rendering. NULL for legacy single-call renders.
+  totalParts   Int? @map("total_parts")
+  currentPart  Int? @map("current_part")
+
+  // Path under STORAGE_DIR for the downloaded mp4. Set when status="ready".
+  outputKey    String? @map("output_key")
+  // Provider's streaming URL (signed, time-limited). Useful for the UI
+  // to preview before the mp4 download finishes locally.
+  videoUrl     String? @map("video_url")
+  thumbnailUrl String? @map("thumbnail_url")
+  durationSec  Float?  @map("duration_sec")
+
+  errorCode    String? @map("error_code")
+  errorMessage String? @map("error_message")
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  startedAt DateTime? @map("started_at") @db.Timestamptz()
+  readyAt   DateTime? @map("ready_at") @db.Timestamptz()
+
+  // One row per HeyGen sub-render that makes up this chunk. UI shows each
+  // part's progress + Play button as it lands so users can preview before
+  // the final merge. Empty until the runner enters its parts loop.
+  parts RenderPart[]
+
+  @@index([jobId])
+  @@index([status])
+  @@map("renders")
+}
+
+// One HeyGen sub-render = one row. A chunk whose enriched script is
+// > HEYGEN_PER_VIDEO_MAX_CHARS gets split into N parts; the runner
+// creates N RenderPart rows up-front, then progresses each from
+// pending → uploading → rendering → ready as HeyGen completes them.
+// `outputKey` points at parts/part-NNN.mp4 on disk while the chunk's
+// final output.mp4 doesn't yet exist (status="parts_ready" on the
+// parent Render). After the user clicks Merge, ffmpeg concats every
+// ready part's file and the parent Render flips to status="ready".
+model RenderPart {
+  id       String @id @default(uuid()) @db.Uuid
+  renderId String @map("render_id") @db.Uuid
+  render   Render @relation(fields: [renderId], references: [id], onDelete: Cascade)
+
+  // 0-based index — matches the order in which the script was split.
+  idx Int
+
+  // pending | uploading | rendering | ready | failed | cancelled
+  status   String @default("pending")
+  progress Int    @default(0)
+
+  // HeyGen video_id for this part. NULL until the createVideo call returns.
+  providerJobId String? @map("provider_job_id")
+
+  // Storage path of the downloaded part-NNN.mp4 (relative to STORAGE_DIR).
+  outputKey String? @map("output_key")
+
+  // HeyGen-reported duration of this sub-render in seconds.
+  durationSec Float? @map("duration_sec")
+
+  // Number of characters in the script segment that produced this part.
+  // Useful for UI display ("Part 2/5 · 2,784 chars · ~3 min").
+  charLength Int? @map("char_length")
+
+  errorCode    String? @map("error_code")
+  errorMessage String? @map("error_message")
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  startedAt DateTime? @map("started_at") @db.Timestamptz()
+  readyAt   DateTime? @map("ready_at") @db.Timestamptz()
+
+  @@unique([renderId, idx])
+  @@index([renderId])
+  @@index([status])
+  @@map("render_parts")
 }

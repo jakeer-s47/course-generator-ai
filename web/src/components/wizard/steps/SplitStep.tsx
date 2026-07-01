@@ -26,6 +26,9 @@ import {
   Flame,
   X,
   Copy,
+  Sun,
+  Globe,
+  Moon,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { useWizard, type CleanLevel, type TopicChunk } from "../WizardContext";
@@ -59,6 +62,19 @@ type SegmentRunRow = {
   errorMessage: string | null;
 };
 
+type EnrichmentSource = {
+  url: string;
+  title: string;
+  snippet: string;
+};
+
+type EnrichmentStatus =
+  | "pending"
+  | "enriching"
+  | "ready"
+  | "skipped"
+  | "failed";
+
 type ChunkRow = {
   id: string;
   segmentRunId: string;
@@ -79,7 +95,22 @@ type ChunkRow = {
     jobId: string;
     sourceName: string;
   } | null;
+  // Web enrichment (Pass 4 of Step 5). When status="ready", enrichedText
+  // is the polished script Step 6 will send to HeyGen. text always stays
+  // populated as ground-truth fallback.
+  enrichedText?: string | null;
+  enrichmentSources?: EnrichmentSource[] | null;
+  enrichmentStatus?: EnrichmentStatus;
+  enrichmentError?: string | null;
+  // Hierarchy. "sun" = navigation grouping (≈25 min), "planet" = render
+  // unit (one avatar video each), "moon" = sub-section inside a planet.
+  // Legacy flat chunks default to "planet" with parentChunkId = NULL —
+  // the tree UI shows them as orphans under a synthetic "Ungrouped" sun.
+  level?: ChunkLevel;
+  parentChunkId?: string | null;
 };
+
+type ChunkLevel = "sun" | "planet" | "moon";
 
 type JobRowMinimal = {
   cleanedVersions: CleanedRow[];
@@ -284,14 +315,28 @@ export function SplitStep() {
         if (cancelled || !data) return;
         setChunks(data.chunks);
         // Mirror into WizardContext so step 6 + canAdvance see real values.
-        const projected: TopicChunk[] = data.chunks.map((c) => ({
-          id: c.id,
-          topic: c.topic,
-          startSec: c.startSec,
-          endSec: c.endSec,
-          wordCount: c.wordCount,
-          preview: c.preview,
-        }));
+        // Only canonical PLANETS are render units — suns are navigation
+        // groupings (no text) and moons are sub-sections. Projecting a sun
+        // here would surface it as a generatable row in Step 6 and a render
+        // on it fails with E_NO_SCRIPT. Legacy flat chunks (level undefined)
+        // are treated as planets. Duplicates are dropped to match the
+        // render route's canonical-planet selection.
+        const projected: TopicChunk[] = data.chunks
+          .filter(
+            (c) => (c.level ?? "planet") === "planet" && !c.duplicateOfChunkId,
+          )
+          .map((c) => {
+            const narrationText = c.enrichedText ?? c.text ?? "";
+            return {
+              id: c.id,
+              topic: c.topic,
+              startSec: c.startSec,
+              endSec: c.endSec,
+              wordCount: c.wordCount,
+              preview: c.preview,
+              narrationChars: narrationText.length,
+            };
+          });
         update({ chunks: projected });
         if (data.chunks.length > 0 && !openId) {
           setOpenId(data.chunks[0].id);
@@ -1414,6 +1459,21 @@ function FailurePanel({
 // real DB rows and the edit operations are real PATCH / POST calls.
 // ---------------------------------------------------------------------------
 
+// Tree-shape props passed down from the parent. Memoised at the
+// ChunksAccordion entry; each PlanetRow is unaware of siblings or moons
+// beyond its own subtree.
+type AccordionHandlers = {
+  openId: string | null;
+  renaming: string | null;
+  onToggleOpen: (id: string) => void;
+  onStartRename: (id: string) => void;
+  onCommitRename: (id: string, value: string) => void;
+  onCancelRename: () => void;
+  onMergeUp: (id: string) => void;
+  onSplitChunk: (id: string) => void;
+  onEditTranscript: (c: ChunkRow) => void;
+};
+
 function ChunksAccordion({
   chunks,
   openId,
@@ -1427,32 +1487,242 @@ function ChunksAccordion({
   onEditTranscript,
 }: {
   chunks: ChunkRow[];
-  openId: string | null;
-  renaming: string | null;
-  onToggleOpen: (id: string) => void;
-  onStartRename: (id: string) => void;
-  onCommitRename: (id: string, value: string) => void;
-  onCancelRename: () => void;
-  onMergeUp: (id: string) => void;
-  onSplitChunk: (id: string) => void;
-  onEditTranscript: (c: ChunkRow) => void;
-}) {
+} & AccordionHandlers) {
+  // Build the tree client-side from the flat chunks array. Group by
+  // parentChunkId; suns are top-level (parent = NULL AND level = "sun").
+  // Legacy flat planets (parent = NULL AND level = "planet") get
+  // collected under a synthetic "Ungrouped" sun so old jobs keep
+  // rendering without breakage.
+  const tree = useMemo(() => buildChunkTree(chunks), [chunks]);
+  const handlers: AccordionHandlers = {
+    openId,
+    renaming,
+    onToggleOpen,
+    onStartRename,
+    onCommitRename,
+    onCancelRename,
+    onMergeUp,
+    onSplitChunk,
+    onEditTranscript,
+  };
+
+  // Local collapse-state for sun headers (default expanded). Independent
+  // of openId which tracks per-planet expansion.
+  const [collapsedSuns, setCollapsedSuns] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const toggleSun = (id: string) =>
+    setCollapsedSuns((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+
   return (
     <motion.div
       initial={{ opacity: 0, y: 10 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.4, delay: 0.1 }}
-      className="rounded-2xl border border-slate-200 bg-white shadow-[0_1px_2px_rgba(9,9,11,0.04)] divide-y divide-slate-200 overflow-hidden"
+      className="flex flex-col gap-3"
     >
-      {chunks.map((c, i) => {
-        const open = openId === c.id;
-        const duration = c.endSec - c.startSec;
-        const isDuplicate = !!c.duplicateOfChunkId;
+      {tree.suns.map((sun, sunIdx) => {
+        const collapsed = collapsedSuns.has(sun.id);
+        const planetCount = sun.planets.length;
+        const sunDur = sun.endSec - sun.startSec;
+        const isLegacy = sun.id.startsWith("__legacy__");
         return (
           <div
-            key={c.id}
-            className={`transition-colors ${isDuplicate ? "bg-amber-50/30" : ""}`}
+            key={sun.id}
+            className="rounded-2xl border border-slate-200 bg-white shadow-[0_1px_2px_rgba(9,9,11,0.04)] overflow-hidden"
           >
+            {/* ─── Sun header ─────────────────────────────────────── */}
+            <button
+              type="button"
+              onClick={() => toggleSun(sun.id)}
+              className={`w-full flex items-center gap-4 px-5 py-3.5 text-left transition-colors ${
+                isLegacy
+                  ? "bg-gradient-to-r from-slate-50 via-white to-slate-50 hover:from-slate-100/70"
+                  : "bg-gradient-to-r from-amber-50/60 via-orange-50/40 to-yellow-50/50 hover:from-amber-100/60 hover:to-yellow-100/60"
+              }`}
+            >
+              <span
+                className={`flex items-center justify-center w-10 h-10 rounded-xl shrink-0 ${
+                  isLegacy
+                    ? "bg-slate-200 text-slate-500"
+                    : "bg-gradient-to-br from-amber-400 via-orange-400 to-yellow-500 text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.3),_0_4px_10px_-2px_rgba(245,158,11,0.4)]"
+                }`}
+              >
+                <Sun size={18} strokeWidth={2.4} />
+              </span>
+              <span className="flex-1 min-w-0">
+                <span className="block text-[10.5px] uppercase tracking-wide font-semibold text-amber-700/80">
+                  {isLegacy ? "Legacy chunks" : `Core concept ${sunIdx + 1}`}
+                </span>
+                <span className="text-[17px] font-semibold text-slate-900 truncate block leading-snug">
+                  {sun.topic}
+                </span>
+                {sun.preview && !isLegacy ? (
+                  <span className="block text-[12.5px] text-slate-500 mt-0.5 truncate">
+                    {sun.preview}
+                  </span>
+                ) : null}
+                {isLegacy ? (
+                  <span className="block text-[12px] text-slate-400 italic mt-0.5">
+                    Click Re-segment to produce a hierarchical outline.
+                  </span>
+                ) : null}
+              </span>
+              <span className="hidden sm:flex items-center gap-2 text-[12.5px] text-slate-500 shrink-0">
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-white border border-slate-200">
+                  <Globe size={10} strokeWidth={2.2} />
+                  <span className="nums font-semibold tabular-nums">
+                    {planetCount}
+                  </span>
+                  <span>planet{planetCount === 1 ? "" : "s"}</span>
+                </span>
+                {sunDur > 0 ? (
+                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-white border border-slate-200">
+                    <Clock size={10} strokeWidth={2} />
+                    <span className="nums font-medium">
+                      {formatDuration(sunDur)}
+                    </span>
+                  </span>
+                ) : null}
+              </span>
+              <motion.span
+                animate={{ rotate: collapsed ? 0 : 180 }}
+                transition={{ duration: 0.25 }}
+                className="text-amber-600/70 shrink-0"
+              >
+                <ChevronDown size={17} strokeWidth={2.2} />
+              </motion.span>
+            </button>
+
+            {/* ─── Planets under this sun ─────────────────────────── */}
+            <AnimatePresence initial={false}>
+              {!collapsed && (
+                <motion.div
+                  initial={{ height: 0, opacity: 0 }}
+                  animate={{ height: "auto", opacity: 1 }}
+                  exit={{ height: 0, opacity: 0 }}
+                  transition={{ duration: 0.28, ease: [0.22, 1, 0.36, 1] }}
+                  className="overflow-hidden border-t border-slate-200"
+                >
+                  <div className="divide-y divide-slate-200">
+                    {sun.planets.map((planet, planetIdx) => (
+                      <PlanetRow
+                        key={planet.id}
+                        planet={planet}
+                        // Global colour seed so each planet still gets a
+                        // distinct accent. Mix in sunIdx so colours don't
+                        // repeat across suns either.
+                        colorSeed={sunIdx * 7 + planetIdx}
+                        handlers={handlers}
+                      />
+                    ))}
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </div>
+        );
+      })}
+    </motion.div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Tree builder — flat chunks → { suns: [{ ..., planets: [{ ..., moons }]}] }
+// ─────────────────────────────────────────────────────────────────────────
+
+type PlanetTreeNode = ChunkRow & { moons: ChunkRow[] };
+type SunTreeNode = ChunkRow & { planets: PlanetTreeNode[] };
+
+function buildChunkTree(chunks: ChunkRow[]): { suns: SunTreeNode[] } {
+  const byParent = new Map<string | "__null__", ChunkRow[]>();
+  for (const c of chunks) {
+    const key = c.parentChunkId ?? "__null__";
+    const list = byParent.get(key);
+    if (list) list.push(c);
+    else byParent.set(key, [c]);
+  }
+  for (const list of byParent.values()) list.sort((a, b) => a.idx - b.idx);
+
+  const tops = byParent.get("__null__") ?? [];
+  const realSuns = tops.filter((c) => c.level === "sun");
+  const orphanPlanets = tops.filter(
+    (c) => c.level !== "sun", // legacy flat chunks: level="planet" by default
+  );
+
+  const buildPlanet = (planet: ChunkRow): PlanetTreeNode => ({
+    ...planet,
+    moons: byParent.get(planet.id) ?? [],
+  });
+
+  const suns: SunTreeNode[] = realSuns.map((s) => ({
+    ...s,
+    planets: (byParent.get(s.id) ?? [])
+      .filter((c) => c.level === "planet")
+      .map(buildPlanet),
+  }));
+
+  // Legacy fallback: synthesise an "Ungrouped" sun so flat-chunk jobs
+  // still render in the new tree UI without an awkward empty state.
+  if (orphanPlanets.length > 0) {
+    const orphanStart = orphanPlanets[0]?.startSec ?? 0;
+    const orphanEnd =
+      orphanPlanets[orphanPlanets.length - 1]?.endSec ?? 0;
+    suns.push({
+      id: `__legacy__${realSuns.length}`,
+      segmentRunId: orphanPlanets[0]?.segmentRunId ?? "",
+      idx: realSuns.length,
+      topic: "Ungrouped chunks",
+      preview: "",
+      startSec: orphanStart,
+      endSec: orphanEnd,
+      wordCount: 0,
+      text: null,
+      level: "sun" as const,
+      parentChunkId: null,
+      planets: orphanPlanets.map(buildPlanet),
+    });
+  }
+  return { suns };
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// PlanetRow — preserves the existing chunk-row look from the flat
+// accordion, plus a moons strip when the planet has sub-sections.
+// ─────────────────────────────────────────────────────────────────────────
+
+function PlanetRow({
+  planet: c,
+  colorSeed: i,
+  handlers,
+}: {
+  planet: PlanetTreeNode;
+  colorSeed: number;
+  handlers: AccordionHandlers;
+}) {
+  const {
+    openId,
+    renaming,
+    onToggleOpen,
+    onStartRename,
+    onCommitRename,
+    onCancelRename,
+    onEditTranscript,
+  } = handlers;
+  const open = openId === c.id;
+  const duration = c.endSec - c.startSec;
+  const isDuplicate = !!c.duplicateOfChunkId;
+  const moons = c.moons;
+  return (
+        <div
+          key={c.id}
+          className={`transition-colors ${isDuplicate ? "bg-amber-50/30" : ""}`}
+        >
             <button
               type="button"
               onClick={() => onToggleOpen(c.id)}
@@ -1533,6 +1803,17 @@ function ChunksAccordion({
                     {c.wordCount.toLocaleString()}
                   </span>
                 </span>
+                {c.enrichmentStatus === "ready" && c.enrichedText ? (
+                  <span
+                    title="Enriched script ready for the avatar narrator"
+                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-gradient-to-r from-violet-50 to-fuchsia-50 border border-violet-200 text-violet-700"
+                  >
+                    <Sparkles size={10} strokeWidth={2.4} />
+                    <span className="font-semibold">
+                      Enriched
+                    </span>
+                  </span>
+                ) : null}
               </span>
               <motion.span
                 animate={{ rotate: open ? 180 : 0 }}
@@ -1556,17 +1837,48 @@ function ChunksAccordion({
                     <p className="text-[16px] text-slate-600 leading-relaxed max-w-3xl mb-4 border-l-2 border-indigo-200 pl-4">
                       {c.preview}
                     </p>
-                    {/* Full transcript text scrollable within the row */}
-                    {c.text ? (
-                      <div className="mb-4 max-w-3xl rounded-lg border border-slate-200 bg-white px-4 py-3 max-h-72 overflow-y-auto">
-                        <p className="text-[10.5px] uppercase tracking-wide font-semibold text-slate-400 mb-1.5">
-                          Transcript
+                    {/* Original transcript + Enriched script (Pass 4 of
+                        Step 5). Tab switcher when enrichment is ready;
+                        falls through to plain transcript otherwise. */}
+                    <ChunkScriptTabs chunk={c} />
+
+                    {/* 🌙 Moons strip — sub-sections inside this planet.
+                        Shown only when present (variable depth). Each
+                        moon is a small chapter marker; clicking does
+                        nothing yet (Step 6 will wire timestamp scrub). */}
+                    {moons.length > 0 ? (
+                      <div className="mb-4 max-w-3xl rounded-lg border border-slate-200 bg-slate-50/50 px-3 py-2">
+                        <p className="text-[10.5px] uppercase tracking-wide font-semibold text-slate-500 mb-1.5 flex items-center gap-1.5">
+                          <Moon size={10} strokeWidth={2.4} />
+                          {moons.length} sub-section
+                          {moons.length === 1 ? "" : "s"}
                         </p>
-                        <p className="text-[14px] text-slate-700 leading-relaxed whitespace-pre-wrap break-words">
-                          {c.text}
-                        </p>
+                        <ul className="divide-y divide-slate-200/70">
+                          {moons.map((m, mi) => (
+                            <li
+                              key={m.id}
+                              className="flex items-center gap-3 py-1.5 text-[13px]"
+                            >
+                              <span className="font-mono text-[11px] text-slate-400 nums tabular-nums w-6 text-right shrink-0">
+                                {String(mi + 1).padStart(2, "0")}
+                              </span>
+                              <span className="font-mono text-[11.5px] text-slate-400 tabular-nums shrink-0 hidden sm:inline">
+                                {formatTimecode(m.startSec).slice(0, 8)}
+                                <span className="text-slate-300 mx-1">→</span>
+                                {formatTimecode(m.endSec).slice(0, 8)}
+                              </span>
+                              <span className="flex-1 min-w-0 text-slate-700 truncate">
+                                {m.topic}
+                              </span>
+                              <span className="text-slate-500 nums tabular-nums shrink-0 text-[12px]">
+                                {formatDuration(m.endSec - m.startSec)}
+                              </span>
+                            </li>
+                          ))}
+                        </ul>
                       </div>
                     ) : null}
+
                     <div className="flex items-center gap-2 flex-wrap">
                       <RowBtn
                         icon={<Pencil size={12} strokeWidth={2} />}
@@ -1594,10 +1906,211 @@ function ChunksAccordion({
               )}
             </AnimatePresence>
           </div>
-        );
-      })}
-    </motion.div>
   );
+}
+
+// ---------------------------------------------------------------------------
+// Per-chunk script tabs — Original transcript vs Enriched (web-sourced).
+// ---------------------------------------------------------------------------
+//
+// Step 5 Pass 4 enriches each canonical chunk with technical web content
+// from Tavily + GPT-4o synthesis. The result is `enrichedText` — the
+// polished script Step 6 sends to HeyGen. We always preserve the
+// original `text` as ground truth, so the user can flip between them.
+//
+// Status branches:
+//   ready    → tab switcher: Original / Enriched (default Enriched)
+//   skipped  → small grey notice; Original transcript still shown
+//   failed   → small red notice with error; Original still shown
+//   pending  → just Original (enrichment hasn't run yet for this chunk)
+//   enriching→ Loader2 spinner with "Enriching with web sources…"
+
+function ChunkScriptTabs({ chunk }: { chunk: ChunkRow }) {
+  const status = chunk.enrichmentStatus ?? "pending";
+  const enrichedReady = status === "ready" && !!chunk.enrichedText;
+
+  // Default tab = Enriched when ready, else Original. State key includes
+  // chunk.id so flipping between rows resets the active tab cleanly.
+  const [tab, setTab] = useState<"enriched" | "original">(() =>
+    enrichedReady ? "enriched" : "original",
+  );
+  // If a chunk's enrichment finishes mid-view (e.g. polling delivers a
+  // fresh row), nudge the tab over to Enriched so the user sees it.
+  useEffect(() => {
+    if (enrichedReady) setTab("enriched");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chunk.id, enrichedReady]);
+
+  if (status === "enriching") {
+    return (
+      <div className="mb-4 max-w-3xl rounded-lg border border-violet-200 bg-violet-50/50 px-4 py-3 flex items-center gap-2">
+        <Loader2
+          size={14}
+          strokeWidth={2.2}
+          className="text-violet-500 animate-spin-slow shrink-0"
+        />
+        <p className="text-[13px] text-violet-700">
+          Enriching with web sources&hellip;
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="mb-4 max-w-3xl">
+      {enrichedReady ? (
+        <div className="inline-flex items-center rounded-lg border border-slate-200 bg-white p-0.5 mb-2 shadow-[0_1px_2px_rgba(9,9,11,0.03)]">
+          <ScriptTabBtn
+            active={tab === "enriched"}
+            onClick={() => setTab("enriched")}
+            tone="violet"
+          >
+            <Sparkles
+              size={11}
+              strokeWidth={2.4}
+              className="-mt-px"
+            />
+            Enriched
+            {Array.isArray(chunk.enrichmentSources) &&
+            chunk.enrichmentSources.length > 0 ? (
+              <span
+                className={`text-[10.5px] tabular-nums nums px-1.5 py-0.5 rounded ${
+                  tab === "enriched"
+                    ? "bg-white/15 text-white"
+                    : "bg-slate-100 text-slate-500"
+                }`}
+              >
+                {chunk.enrichmentSources.length}
+              </span>
+            ) : null}
+          </ScriptTabBtn>
+          <ScriptTabBtn
+            active={tab === "original"}
+            onClick={() => setTab("original")}
+            tone="slate"
+          >
+            <FileText size={11} strokeWidth={2.4} className="-mt-px" />
+            Original
+          </ScriptTabBtn>
+        </div>
+      ) : null}
+
+      {/* Status notice for non-ready states */}
+      {status === "skipped" ? (
+        <div className="mb-2 rounded-md border border-slate-200 bg-slate-50/70 px-3 py-1.5 text-[12px] text-slate-500">
+          Enrichment skipped
+          {chunk.enrichmentError ? (
+            <span className="text-slate-400"> — {chunk.enrichmentError}</span>
+          ) : null}
+        </div>
+      ) : null}
+      {status === "failed" ? (
+        <div className="mb-2 rounded-md border border-rose-200 bg-rose-50/70 px-3 py-1.5 text-[12px] text-rose-700 flex items-start gap-1.5">
+          <AlertTriangle size={12} strokeWidth={2.2} className="mt-[2px] shrink-0" />
+          <span>
+            Enrichment failed
+            {chunk.enrichmentError ? (
+              <span className="text-rose-600/80"> — {chunk.enrichmentError}</span>
+            ) : null}
+          </span>
+        </div>
+      ) : null}
+
+      {/* Script body — Enriched takes precedence when active, else Original. */}
+      {tab === "enriched" && enrichedReady ? (
+        <div className="rounded-lg border border-violet-200 bg-gradient-to-br from-violet-50/40 via-white to-fuchsia-50/30 px-4 py-3 max-h-72 overflow-y-auto">
+          <p className="text-[10.5px] uppercase tracking-wide font-semibold text-violet-600/80 mb-1.5">
+            Enriched script · sent to avatar
+          </p>
+          <p className="text-[14px] text-slate-800 leading-relaxed whitespace-pre-wrap break-words">
+            {chunk.enrichedText}
+          </p>
+        </div>
+      ) : chunk.text ? (
+        <div className="rounded-lg border border-slate-200 bg-white px-4 py-3 max-h-72 overflow-y-auto">
+          <p className="text-[10.5px] uppercase tracking-wide font-semibold text-slate-400 mb-1.5">
+            Original transcript
+          </p>
+          <p className="text-[14px] text-slate-700 leading-relaxed whitespace-pre-wrap break-words">
+            {chunk.text}
+          </p>
+        </div>
+      ) : null}
+
+      {/* Sources panel — only for the Enriched tab */}
+      {tab === "enriched" &&
+      enrichedReady &&
+      Array.isArray(chunk.enrichmentSources) &&
+      chunk.enrichmentSources.length > 0 ? (
+        <div className="mt-3 rounded-lg border border-slate-200 bg-white px-4 py-3">
+          <p className="text-[10.5px] uppercase tracking-wide font-semibold text-slate-400 mb-2">
+            Sources used
+          </p>
+          <ol className="space-y-1.5">
+            {chunk.enrichmentSources.map((s, i) => (
+              <li
+                key={`${s.url}-${i}`}
+                className="text-[13px] text-slate-700 leading-snug flex gap-2"
+              >
+                <span className="font-mono text-[11.5px] text-slate-400 shrink-0 mt-0.5">
+                  [{i + 1}]
+                </span>
+                <span className="min-w-0">
+                  <a
+                    href={s.url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-violet-700 hover:underline font-medium break-all"
+                  >
+                    {s.title || s.url}
+                  </a>
+                  <span className="block text-[11.5px] text-slate-400 truncate">
+                    {hostFromUrl(s.url)}
+                  </span>
+                </span>
+              </li>
+            ))}
+          </ol>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function ScriptTabBtn({
+  active,
+  onClick,
+  tone,
+  children,
+}: {
+  active: boolean;
+  onClick: () => void;
+  tone: "violet" | "slate";
+  children: React.ReactNode;
+}) {
+  const activeBg =
+    tone === "violet"
+      ? "bg-gradient-to-br from-violet-600 to-fuchsia-600 text-white shadow-[0_1px_2px_rgba(124,58,237,0.3)]"
+      : "bg-slate-900 text-white shadow-[0_1px_2px_rgba(9,9,11,0.15)]";
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-[12.5px] font-medium transition-colors ${
+        active ? activeBg : "text-slate-600 hover:bg-slate-50"
+      }`}
+    >
+      {children}
+    </button>
+  );
+}
+
+function hostFromUrl(url: string): string {
+  try {
+    return new URL(url).hostname.replace(/^www\./, "");
+  } catch {
+    return url;
+  }
 }
 
 // ---------------------------------------------------------------------------
